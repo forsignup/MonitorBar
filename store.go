@@ -4,9 +4,12 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"path/filepath"
 	"slices"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,28 +49,73 @@ func sceneByID(id string) scene {
 	return scenes[0]
 }
 
+// displayState is one monitor's runtime state: what the panel shows and the
+// channels that reach it. The settings it reads and writes live in prefs.
+type displayState struct {
+	id      string
+	monitor display.Monitor
+	prefs   *monitorPrefs
+
+	modes       []display.Mode
+	current     display.Mode
+	hasCurrent  bool
+	switchingTo string // the mode the LAN remote is switching the monitor to
+
+	link      *mitv.Link // the monitor's LAN remote, nil until found
+	detecting bool       // a scan is queued or running, for the switcher
+	lanFailed bool       // the last scan did not reach the paired device
+	inputs    []mitv.Source
+	input     int // the input chosen in the app, 0 before any
+	volume    float64
+	hasVolume bool
+	unmuted   float64 // the volume to go back to from mute, 0 when not muted
+
+	// DDC/CI, when the monitor answers it: hardware brightness, inputs and
+	// volume (when the LAN remote has none), and picture controls.
+	ddc           *display.DDC
+	probingDDC    bool
+	hardwareError error // why DDC/CI is unavailable, nil before the probe
+	brightness    float64
+	hasBrightness bool
+	ddcInputs     []mitv.Source
+	ddcVolume     bool
+	controls      []control
+	maxima        map[byte]int // the range of each VCP code
+
+	volumeTarget atomic.Int64
+	deviceVolume int // the monitor's volume as last known
+	chasing      bool
+
+	// Following the built-in display: its brightness last seen (-1 before
+	// any), and the backlight being eased toward.
+	lastBuiltin  float64
+	followTarget float64
+	easing       bool
+
+	// The probes in flight, which the UI flags don't tell apart from those
+	// merely queued, and a generation that changes when the display is
+	// replugged so a stale probe's result is dropped.
+	ddcStarted, lanStarted bool
+	gen                    int
+}
+
 // store holds what the panel shows and the actions that change it. Its
 // fields are read and written on the main thread only: network work runs in
 // goroutines and hands its results back through post.
 type store struct {
 	prefs    *settings
 	tracker  *usage.Tracker
-	redraw   func()                                 // asks the open panel for a new frame
-	setGamma func(brightness, warmth float64) error // the monitor's, replaced in tests
+	redraw   func()                                                          // asks the open panel for a new frame
+	setGamma func(monitor display.Monitor, brightness, warmth float64) error // replaced in tests
 
-	monitor     display.Monitor
-	modes       []display.Mode
-	current     display.Mode
-	hasCurrent  bool
-	switchingTo string // the mode the LAN remote is switching the monitor to
+	// The monitors, by identity, in the system's order.
+	displays map[string]*displayState
+	order    []string
+	targetID string
 
-	link      *mitv.Link // the display's LAN remote, nil until found
-	detecting bool
-	inputs    []mitv.Source
-	input     int // the input chosen in the app, 0 before any
-	volume    float64
-	hasVolume bool
-	unmuted   float64 // the volume to go back to from mute, 0 when not muted
+	// The built-in display's settings while there is no external one, and
+	// the version 1 fields they come from.
+	builtinPrefs *monitorPrefs
 
 	usage         []usage.Day
 	launchAtLogin bool
@@ -81,30 +129,18 @@ type store struct {
 	// onAdjust shows the HUD for a level a key just set.
 	onAdjust func(hudKind)
 	// The media keys: taken where the user asked and macOS allows.
-	soundToDisplay  func() bool // whether the sound goes to the display, fixed in tests
-	mediaKeysDenied bool        // asked for, without the Accessibility permission
+	soundToDisplay  func() bool           // whether the sound goes to a display, fixed in tests
+	soundOutput     func() (string, bool) // the default output's name, when it is a display
+	mediaKeysDenied bool                  // asked for, without the Accessibility permission
 
-	notice string
-	dirty  bool // prefs changed since the last save
-
-	volumeTarget atomic.Int64
-	deviceVolume int // the display's volume as last known
-	chasing      bool
-
-	// DDC/CI, when the monitor answers it: hardware brightness, inputs and
-	// volume (when the LAN remote has none), and picture controls.
-	ddc           *display.DDC
-	probingDDC    bool
-	brightness    float64 // hardware %, meaningful when hasBrightness
-	hasBrightness bool
-	ddcInputs     []mitv.Source
-	ddcVolume     bool
-	controls      []control
-	maxima        map[byte]int // the range of each VCP code
+	notice   string
+	dirty    bool          // prefs changed since the last save
+	hudState *displayState // the monitor the HUD last showed
 
 	// The day and night start times as the time inputs edit them.
 	dayStart, nightStart time.Time
 	now                  func() time.Time // the clock, fixed in tests
+	hasBuiltin           bool
 
 	// Updates, for builds that can update themselves.
 	canUpdate  bool
@@ -112,12 +148,17 @@ type store struct {
 	installing bool
 	progress   int // percent downloaded
 
-	// Following the built-in display: whether there is one, its brightness
-	// last seen (-1 before any), and the backlight being eased toward.
-	hasBuiltin   bool
-	lastBuiltin  float64
-	followTarget float64
-	easing       bool
+	// The display enumeration, fixed in tests that plug and unplug monitors.
+	allDisplays       func() []display.Monitor
+	targetDisplay     func() display.Monitor
+	builtinBrightness func() (float64, bool)
+
+	// The LAN scan's cache and last results: one scan at a time, shared by
+	// every display's probe. devices is for the panel, on the main thread.
+	scanMu    sync.Mutex
+	scanAt    time.Time
+	scanFound []mitv.Device
+	devices   []mitv.Device
 }
 
 // control is a picture setting the monitor offers over DDC/CI.
@@ -140,22 +181,35 @@ var controlCatalog = []struct {
 
 func newStore() *store {
 	s := &store{
-		prefs:          loadSettings(),
-		tracker:        usage.Open(filepath.Join(dataDir(), "usage.json")),
-		redraw:         func() {},
-		now:            time.Now,
-		launchAtLogin:  mygo.App.OpenAtLogin(),
-		canUpdate:      mygo.Updater.Enabled(),
-		lastBuiltin:    -1,
-		registered:     map[string]string{},
-		soundToDisplay: display.SoundToDisplay,
-		keyHeld:        keystate.Held,
-		onAdjust:       func(hudKind) {},
+		prefs:             loadSettings(),
+		tracker:           usage.Open(filepath.Join(dataDir(), "usage.json")),
+		redraw:            func() {},
+		now:               time.Now,
+		launchAtLogin:     mygo.App.OpenAtLogin(),
+		canUpdate:         mygo.Updater.Enabled(),
+		registered:        map[string]string{},
+		soundToDisplay:    display.SoundToDisplay,
+		soundOutput:       display.SoundOutputName,
+		keyHeld:           keystate.Held,
+		onAdjust:          func(hudKind) {},
+		displays:          map[string]*displayState{},
+		allDisplays:       display.All,
+		targetDisplay:     display.Target,
+		builtinBrightness: display.BuiltinBrightness,
 	}
 	s.dayStart, s.nightStart = parseClock(s.prefs.DayStart, 7*60), parseClock(s.prefs.NightStart, 19*60)
-	s.refreshDisplay()
-	s.setGamma = func(b, w float64) error { return s.monitor.SetGamma(b, w) }
-	s.applyGamma()
+	// Before the first external display appears, the built-in one takes the
+	// version 1 flat settings; the migration copies them when one does.
+	if s.prefs.needsMigration() && s.prefs.Monitors["builtin"] == nil {
+		p := s.prefs.legacyPrefs()
+		s.prefs.Monitors["builtin"] = &p
+	}
+	s.builtinPrefs = s.prefs.Monitors["builtin"]
+	s.refreshDisplays()
+	s.setGamma = func(m display.Monitor, b, w float64) error { return m.SetGamma(b, w) }
+	for _, st := range s.stateList() {
+		s.applyGammaFor(st)
+	}
 	s.usage = s.tracker.Recent(7)
 	return s
 }
@@ -168,34 +222,154 @@ func (s *store) post(fn func()) {
 	})
 }
 
+// MARK: Displays and the target
+
+// targetState is the monitor the panel and the shortcuts act on. It is never
+// nil: with no external display it is the built-in one, and in a store
+// without any display it is an empty one the tests edit.
+func (s *store) targetState() *displayState {
+	if st := s.displays[s.targetID]; st != nil {
+		return st
+	}
+	if len(s.order) > 0 {
+		if st := s.displays[s.order[0]]; st != nil {
+			s.targetID = st.id
+			return st
+		}
+	}
+	st := &displayState{id: "", monitor: display.Monitor{Builtin: true}, prefs: defaultPrefsPointer(), lastBuiltin: -1}
+	if s.displays == nil {
+		s.displays = map[string]*displayState{}
+	}
+	s.displays[""], s.order, s.targetID = st, []string{""}, ""
+	return st
+}
+
+// defaultPrefsPointer is a monitor record for a store with no monitor.
+func defaultPrefsPointer() *monitorPrefs {
+	p := defaultMonitorPrefs()
+	return &p
+}
+
+// targetPrefs are the target's choices.
+func (s *store) targetPrefs() *monitorPrefs { return s.targetState().prefs }
+
+// stateList returns the monitors in the system's order.
+func (s *store) stateList() []*displayState {
+	out := make([]*displayState, 0, len(s.order))
+	for _, id := range s.order {
+		if st := s.displays[id]; st != nil {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
+// multi reports more than one managed display, when the switcher shows.
+func (s *store) displayCount() int { return len(s.order) }
+
+// selectTarget makes id the monitor the panel and shortcuts act on.
+func (s *store) selectTarget(id string) {
+	if s.displays[id] == nil || s.targetID == id {
+		return
+	}
+	s.targetID = id
+	if st := s.displays[id]; st != nil && !st.monitor.Builtin {
+		// Save an identity, not the state's defensive #n suffix for displays
+		// the platform couldn't tell apart.
+		s.prefs.Selected, s.dirty = monitorKey(st.monitor), true
+	}
+	st := s.targetState()
+	s.detectState(st)
+	s.redraw()
+}
+
+// displayName names a monitor: "Name · HDMI".
+func (st *displayState) displayName() string {
+	name := cmp.Or(st.monitor.Name, locales.MonitorUnnamed())
+	if st.monitor.Connection != "" {
+		return name + " · " + st.monitor.Connection
+	}
+	return name
+}
+
+// switcherLabel tells same-named monitors apart when the system doesn't say
+// which cable reaches each: they are numbered in the system's order, the
+// best a name alone can do.
+func (s *store) switcherLabel(id string) string {
+	st := s.displays[id]
+	if st == nil {
+		return ""
+	}
+	label := st.displayName()
+	shared := 0
+	for _, other := range s.stateList() {
+		if other.displayName() == label {
+			shared++
+		}
+	}
+	if shared > 1 {
+		// The system doesn't say which cable reaches each: the port's own
+		// key is the next best thing, and the order when there is none.
+		if position := shortPosition(st.monitor.Position); position != "" {
+			label += " · " + position
+		} else {
+			label += fmt.Sprintf(" · %d", slices.Index(s.order, id)+1)
+		}
+	}
+	if st.detecting || st.probingDDC {
+		label += " · " + locales.DetectingShort()
+	}
+	return label
+}
+
+// shortPosition trims a platform location key to something a menu item can
+// show: the last part of a UUID or device path.
+func shortPosition(position string) string {
+	position = strings.TrimRight(position, "/")
+	if i := strings.LastIndexAny(position, "/#"); i >= 0 {
+		position = position[i+1:]
+	}
+	if len(position) > 8 {
+		position = position[len(position)-8:]
+	}
+	return position
+}
+
 // MARK: Picture (software, through the gamma table)
 
 func (s *store) setSoftBrightness(percent float64) {
-	s.prefs.SoftBrightness = percent
-	s.applyGamma()
+	st := s.targetState()
+	st.prefs.SoftBrightness = percent
+	s.applyGammaFor(st)
 }
 
 func (s *store) setWarmth(percent float64) {
-	s.prefs.Warmth = percent
-	s.applyGamma()
+	st := s.targetState()
+	st.prefs.Warmth = percent
+	s.applyGammaFor(st)
 }
 
 // apply sets a scene's brightness, on the backlight when DDC/CI reaches it,
 // and its warmth.
-func (s *store) apply(sc scene) {
-	if s.hasBrightness {
-		s.setBrightness(sc.brightness)
-		s.prefs.SoftBrightness = 100 // a scene's brightness is all backlight
+func (s *store) apply(sc scene) { s.applyTo(s.targetState(), sc) }
+
+func (s *store) applyTo(st *displayState, sc scene) {
+	if st.hasBrightness {
+		s.setBrightnessFor(st, sc.brightness)
+		st.prefs.SoftBrightness = 100 // a scene's brightness is all backlight
 	} else {
-		s.prefs.SoftBrightness = sc.brightness
+		st.prefs.SoftBrightness = sc.brightness
 	}
-	s.prefs.Warmth = sc.warmth
-	s.applyGamma()
+	st.prefs.Warmth = sc.warmth
+	s.applyGammaFor(st)
 }
 
-func (s *store) isActive(sc scene) bool {
-	return math.Abs(s.effectiveBrightness()-sc.brightness) < 1 && math.Abs(s.prefs.Warmth-sc.warmth) < 1 &&
-		(!s.hasBrightness || s.prefs.SoftBrightness >= 99.5)
+func (s *store) isActive(sc scene) bool { return isActiveScene(s.targetState(), sc) }
+
+func isActiveScene(st *displayState, sc scene) bool {
+	return math.Abs(effectiveBrightness(st)-sc.brightness) < 1 && math.Abs(st.prefs.Warmth-sc.warmth) < 1 &&
+		(!st.hasBrightness || st.prefs.SoftBrightness >= 99.5)
 }
 
 // Combined brightness, as BetterDisplay and MonitorControl have it (#9):
@@ -224,49 +398,65 @@ func split(combined float64) (hardware, soft float64) {
 	return 0, softMin + max(combined, 0)/switchover*(100-softMin)
 }
 
-func (s *store) combinedBrightness() float64 { return combine(s.brightness, s.prefs.SoftBrightness) }
+func (s *store) combinedBrightness() float64 { return combinedBrightnessFor(s.targetState()) }
+
+func combinedBrightnessFor(st *displayState) float64 {
+	return combine(st.brightness, st.prefs.SoftBrightness)
+}
 
 // setCombined sets the backlight and the software dimming of a combined
 // brightness, writing only what changed: DDC/CI is slow.
-func (s *store) setCombined(combined float64) {
+func (s *store) setCombined(combined float64) { s.setCombinedFor(s.targetState(), combined) }
+
+func (s *store) setCombinedFor(st *displayState, combined float64) {
 	hardware, soft := split(combined)
-	if hardware != s.brightness {
-		s.setBrightness(hardware)
+	if hardware != st.brightness {
+		s.setBrightnessFor(st, hardware)
 	}
-	if soft != s.prefs.SoftBrightness {
-		s.prefs.SoftBrightness = soft
-		s.applyGamma()
+	if soft != st.prefs.SoftBrightness {
+		st.prefs.SoftBrightness = soft
+		s.applyGammaFor(st)
 	}
 }
 
 // stepBrightness moves the brightness by delta points, on the combined
 // scale when DDC/CI reaches the backlight.
-func (s *store) stepBrightness(delta float64) {
-	if s.hasBrightness {
-		s.setCombined(min(max(s.combinedBrightness()+delta, 0), 100))
+func (s *store) stepBrightness(delta float64) { s.stepBrightnessFor(s.targetState(), delta) }
+
+func (s *store) stepBrightnessFor(st *displayState, delta float64) {
+	if st.hasBrightness {
+		s.setCombinedFor(st, min(max(combinedBrightnessFor(st)+delta, 0), 100))
 		return
 	}
-	s.prefs.SoftBrightness = min(max(s.prefs.SoftBrightness+delta, softMin), 100)
-	s.applyGamma()
+	st.prefs.SoftBrightness = min(max(st.prefs.SoftBrightness+delta, softMin), 100)
+	s.applyGammaFor(st)
 }
 
 // effectiveBrightness is the backlight's when DDC/CI reaches it, else the
 // software dimming's.
-func (s *store) effectiveBrightness() float64 {
-	if s.hasBrightness {
-		return s.brightness
+func (s *store) effectiveBrightness() float64 { return effectiveBrightness(s.targetState()) }
+
+func effectiveBrightness(st *displayState) float64 {
+	if st.hasBrightness {
+		return st.brightness
 	}
-	return s.prefs.SoftBrightness
+	return st.prefs.SoftBrightness
 }
 
 func (s *store) resetSoftware() {
-	s.prefs.SoftBrightness, s.prefs.Warmth = 100, 0
-	s.applyGamma()
+	st := s.targetState()
+	st.prefs.SoftBrightness, st.prefs.Warmth = 100, 0
+	s.applyGammaFor(st)
 }
 
-func (s *store) applyGamma() {
+func (s *store) applyGamma() { s.applyGammaFor(s.targetState()) }
+
+func (s *store) applyGammaFor(st *displayState) {
+	if s.setGamma == nil || st.monitor.Name == "" && st.monitor.Identity == "" {
+		return
+	}
 	s.dirty = true
-	err := s.setGamma(s.prefs.SoftBrightness/100, s.prefs.Warmth/100)
+	err := s.setGamma(st.monitor, st.prefs.SoftBrightness/100, st.prefs.Warmth/100)
 	switch {
 	case errors.Is(err, display.ErrGammaLimited):
 		s.notice = locales.NoticeGammaLimited()
@@ -277,74 +467,242 @@ func (s *store) applyGamma() {
 	}
 }
 
+// soundDisplay is the monitor the sound goes out of, when its audio device
+// carries the monitor's name; nil when macOS doesn't say which one it is.
+func (s *store) soundDisplay() *displayState {
+	name, onDisplay := s.soundOutput()
+	if !onDisplay || name == "" {
+		return nil
+	}
+	var found *displayState
+	for _, st := range s.stateList() {
+		if st.monitor.Builtin || !sameDeviceName(st.monitor.Name, name) {
+			continue
+		}
+		if found != nil {
+			return nil // two same-named monitors: macOS doesn't say which one
+		}
+		found = st
+	}
+	return found
+}
+
+// sameDeviceName compares a monitor's name with an audio device's: the
+// system often drops "显示器" or spacing from the one it reports.
+func sameDeviceName(monitor, output string) bool {
+	a, b := deviceNameKey(monitor), deviceNameKey(output)
+	if len(a) < 3 || len(b) < 3 {
+		return false
+	}
+	return strings.Contains(a, b) || strings.Contains(b, a)
+}
+
+func deviceNameKey(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' {
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	out = strings.ReplaceAll(out, "monitor", "")
+	return strings.ReplaceAll(out, "显示器", "")
+}
+
 // MARK: Network (HyperOS)
 
 // sources are the inputs to switch between: the LAN remote's, else DDC/CI's.
-func (s *store) sources() []mitv.Source {
-	if s.link != nil {
-		return s.inputs
+func (s *store) sources() []mitv.Source { return sourcesFor(s.targetState()) }
+
+func sourcesFor(st *displayState) []mitv.Source {
+	if st.link != nil {
+		return st.inputs
 	}
-	return s.ddcInputs
+	return st.ddcInputs
 }
 
 // inputChannel names how inputs are switched, for the inputs card.
-func (s *store) inputChannel() string {
-	if s.link != nil {
+func (s *store) inputChannel() string { return inputChannelFor(s.targetState()) }
+
+func inputChannelFor(st *displayState) string {
+	if st.link != nil {
 		return locales.InputsOverLan()
 	}
 	return "DDC/CI"
 }
 
-// connect finds the display on the LAN: the host found last time first,
-// then a scan.
-func (s *store) connect() {
-	if s.detecting {
+// connect finds the target's display on the LAN: the host found last time
+// first, then a scan.
+func (s *store) connect() { s.startLAN(s.targetState()) }
+
+// startLAN looks for the monitor's LAN remote in the background.
+func (s *store) startLAN(st *displayState) {
+	if st.lanStarted || st.monitor.Builtin {
+		if st.monitor.Builtin {
+			st.detecting = false
+		}
 		return
 	}
-	s.detecting = true
-	cached := s.prefs.NetworkHost
+	st.lanStarted, st.detecting = true, true
+	m, cached, gen := st.monitor, st.prefs.NetworkHost, st.gen
+	taken := s.takenHosts(st.id)
 	go func() {
-		link := mitv.New(cached)
-		// The host found last time must still be a monitor: addresses move.
-		if cached == "" || !link.IsMonitor() {
-			link = nil
-			if host, err := mitv.Discover(); err == nil {
-				link = mitv.New(host)
-			}
-		}
-		var sources []mitv.Source
-		volume, volumeErr := 0, error(nil)
-		if link != nil {
-			var err error
-			if sources, err = link.Sources(); err != nil || len(sources) == 0 {
-				link = nil
-			} else {
-				volume, volumeErr = link.Volume()
-			}
-		}
+		link, sources, volume, volumeErr, devices := s.connectDevice(m, cached, taken)
 		s.post(func() {
-			s.detecting = false
-			s.link = link
-			if link == nil {
-				s.inputs, s.hasVolume = nil, s.ddcVolume // DDC/CI may still have volume
+			if devices != nil {
+				s.devices = devices
+			}
+			if s.displays[st.id] != st || st.gen != gen {
+				if link != nil {
+					go link.Close()
+				}
 				return
 			}
-			s.prefs.NetworkHost, s.dirty = link.Host, true
-			slices.SortFunc(sources, func(a, b mitv.Source) int { return a.ID - b.ID })
-			s.inputs = sources
-			if volumeErr == nil {
-				s.deviceVolume, s.volume, s.hasVolume = volume, float64(volume), true
-			}
+			st.lanStarted, st.detecting = false, false
+			s.applyLink(st, link, sources, volume, volumeErr)
 		})
 	}()
 }
 
-func (s *store) selectInput(src mitv.Source) {
-	s.input = src.ID
-	link := s.link
+// connectDevice validates the cached host, else scans and pairs the monitor.
+func (s *store) connectDevice(m display.Monitor, cached string, taken map[string]bool) (link *mitv.Link, sources []mitv.Source, volume int, volumeErr error, devices []mitv.Device) {
+	if cached != "" {
+		l := mitv.New(cached)
+		// The address may now belong to another device, or to none: a
+		// cached pairing is not trusted without a monitor answering.
+		if d, ok := l.Probe(); ok && len(d.Sources) > 0 {
+			v, verr := l.Volume()
+			return l, d.Sources, v, verr, nil
+		}
+	}
+	found, err := s.lanScan()
+	if err != nil {
+		return nil, nil, 0, nil, nil
+	}
+	if d := mitv.Match(m.Name, found, taken); d != nil {
+		l := mitv.New(d.Host)
+		v, verr := l.Volume()
+		return l, d.Sources, v, verr, found
+	}
+	return nil, nil, 0, nil, found
+}
+
+// applyLink takes the LAN probe's result on the main thread.
+func (s *store) applyLink(st *displayState, link *mitv.Link, sources []mitv.Source, volume int, volumeErr error) {
+	if link != nil {
+		// Two probes can run at once; one device belongs to one display.
+		for id, other := range s.displays {
+			if id == st.id || other.prefs == nil {
+				continue
+			}
+			if other.prefs.NetworkHost == link.Host {
+				go link.Close()
+				link = nil
+				break
+			}
+		}
+	}
+	st.link, st.lanFailed = link, link == nil
 	if link == nil {
-		if s.ddc != nil {
-			s.ddc.Set(display.VCPInput, src.ID)
+		st.inputs = nil
+		st.hasVolume = st.ddcVolume // DDC/CI may still have volume
+		return
+	}
+	st.prefs.NetworkHost, s.dirty = link.Host, true
+	if st.prefs == s.builtinPrefs {
+		s.syncLegacy()
+	}
+	slices.SortFunc(sources, func(a, b mitv.Source) int { return a.ID - b.ID })
+	st.inputs = sources
+	st.hasVolume = st.ddcVolume // until the remote answers, DDC/CI is the fallback
+	if volumeErr == nil {
+		st.deviceVolume, st.volume, st.hasVolume = volume, float64(volume), true
+	}
+}
+
+// lanScan scans once for every display probing at the same time.
+func (s *store) lanScan() ([]mitv.Device, error) {
+	s.scanMu.Lock()
+	defer s.scanMu.Unlock()
+	if len(s.scanFound) > 0 && time.Since(s.scanAt) < 5*time.Second {
+		return s.scanFound, nil
+	}
+	found, err := mitv.DiscoverAll()
+	if err != nil {
+		return nil, err
+	}
+	s.scanFound, s.scanAt = found, time.Now()
+	return found, nil
+}
+
+// takenHosts are the addresses already paired with another display.
+func (s *store) takenHosts(except string) map[string]bool {
+	taken := map[string]bool{}
+	for id, st := range s.displays {
+		if id == except || st.prefs == nil {
+			continue
+		}
+		if st.prefs.NetworkHost != "" {
+			taken[st.prefs.NetworkHost] = true
+		}
+	}
+	return taken
+}
+
+// freeDevices lists the LAN remotes no other display uses.
+func (s *store) freeDevices() []mitv.Device {
+	taken := s.takenHosts(s.targetID)
+	var out []mitv.Device
+	for _, d := range s.devices {
+		if !taken[d.Host] {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// unpaired reports the target has no LAN remote chosen yet: a pairing card
+// may help when the network has devices.
+func (s *store) unpaired() bool {
+	st := s.targetState()
+	if st.link != nil || st.monitor.Builtin {
+		return false
+	}
+	// A paired address that no longer answers is worth replacing, when the
+	// network shows another device; a monitor simply unplugged has nothing
+	// to offer and keeps its pairing.
+	return st.prefs.NetworkHost == "" || st.lanFailed
+}
+
+// pair binds the target to a device chosen by the user. A device the last
+// scan saw is taken as it is: the panel updates at once, and the volume is
+// read when it opens.
+func (s *store) pair(host string) {
+	st := s.targetState()
+	for _, d := range s.devices {
+		if d.Host == host {
+			st.lanStarted, st.detecting = false, false
+			s.applyLink(st, mitv.New(host), d.Sources, 0, errVolumeUnread)
+			return
+		}
+	}
+	st.prefs.NetworkHost, s.dirty = host, true
+	st.link, st.inputs, st.hasVolume = nil, nil, false
+	st.lanStarted = false
+	s.startLAN(st)
+}
+
+// errVolumeUnread says a pairing happened before the volume was read.
+var errVolumeUnread = errors.New("store: the volume was not read yet")
+
+func (s *store) selectInput(src mitv.Source) { s.selectInputFor(s.targetState(), src) }
+
+func (s *store) selectInputFor(st *displayState, src mitv.Source) {
+	st.input = src.ID
+	link := st.link
+	if link == nil {
+		if st.ddc != nil {
+			st.ddc.Set(display.VCPInput, src.ID)
 		}
 		return
 	}
@@ -356,51 +714,57 @@ func (s *store) selectInput(src mitv.Source) {
 }
 
 // stepVolume moves the volume by delta points, when it can be set.
-func (s *store) stepVolume(delta float64) {
-	if s.hasVolume {
-		s.setVolume(min(max(s.volume+delta, 0), 100))
+func (s *store) stepVolume(delta float64) { s.stepVolumeFor(s.targetState(), delta) }
+
+func (s *store) stepVolumeFor(st *displayState, delta float64) {
+	if st.hasVolume {
+		s.setVolumeFor(st, min(max(st.volume+delta, 0), 100))
 	}
 }
 
 // toggleMute takes the volume to 0, or back to what it was: neither the LAN
 // remote nor every DDC/CI display has a mute.
-func (s *store) toggleMute() {
-	if !s.hasVolume {
+func (s *store) toggleMute() { s.toggleMuteFor(s.targetState()) }
+
+func (s *store) toggleMuteFor(st *displayState) {
+	if !st.hasVolume {
 		return
 	}
-	if s.volume > 0 {
-		s.unmuted = s.volume
-		s.setVolume(0)
+	if st.volume > 0 {
+		st.unmuted = st.volume
+		s.setVolumeFor(st, 0)
 		return
 	}
-	s.setVolume(cmp.Or(s.unmuted, defaultUnmuted))
+	s.setVolumeFor(st, cmp.Or(st.unmuted, defaultUnmuted))
 }
 
 const defaultUnmuted = 20 // the volume unmuting goes to, when it was muted elsewhere
 
-func (s *store) setVolume(percent float64) {
+func (s *store) setVolume(percent float64) { s.setVolumeFor(s.targetState(), percent) }
+
+func (s *store) setVolumeFor(st *displayState, percent float64) {
 	if percent > 0 {
-		s.unmuted = 0
+		st.unmuted = 0
 	}
-	s.volume = percent
-	if s.link == nil {
-		s.setDDC(display.VCPVolume, percent)
+	st.volume = percent
+	if st.link == nil {
+		s.setDDCFor(st, display.VCPVolume, percent)
 		return
 	}
-	s.volumeTarget.Store(int64(math.Round(percent)))
-	s.chaseVolume()
+	st.volumeTarget.Store(int64(math.Round(percent)))
+	s.chaseVolume(st)
 }
 
 // chaseVolume steps toward the latest target: the API only has ±1 keys.
-func (s *store) chaseVolume() {
-	if s.link == nil || s.chasing {
+func (s *store) chaseVolume(st *displayState) {
+	if st.link == nil || st.chasing {
 		return
 	}
-	s.chasing = true
-	link, actual := s.link, s.deviceVolume
+	st.chasing = true
+	link, actual := st.link, st.deviceVolume
 	go func() {
 		failed := false
-		for target := int(s.volumeTarget.Load()); target != actual; target = int(s.volumeTarget.Load()) {
+		for target := int(st.volumeTarget.Load()); target != actual; target = int(st.volumeTarget.Load()) {
 			key, step := "volumeup", 1
 			if target < actual {
 				key, step = "volumedown", -1
@@ -412,22 +776,24 @@ func (s *store) chaseVolume() {
 			actual += step
 		}
 		s.post(func() {
-			s.chasing = false
-			s.deviceVolume = actual
+			st.chasing = false
+			st.deviceVolume = actual
 			switch {
 			case failed:
 				s.notice = locales.NoticeVolumeFailed()
-			case int(s.volumeTarget.Load()) != actual:
-				s.chaseVolume() // the slider moved while the last step was sent
+			case int(st.volumeTarget.Load()) != actual:
+				s.chaseVolume(st) // the slider moved while the last step was sent
 			default:
-				s.readVolume()
+				s.readVolumeFor(st)
 			}
 		})
 	}()
 }
 
-func (s *store) readVolume() {
-	link := s.link
+func (s *store) readVolume() { s.readVolumeFor(s.targetState()) }
+
+func (s *store) readVolumeFor(st *displayState) {
+	link := st.link
 	if link == nil {
 		return
 	}
@@ -437,9 +803,12 @@ func (s *store) readVolume() {
 			return
 		}
 		s.post(func() {
-			s.deviceVolume, s.hasVolume = v, true
-			if !s.chasing {
-				s.volume = float64(v)
+			if s.displays[st.id] != st {
+				return
+			}
+			st.deviceVolume, st.hasVolume = v, true
+			if !st.chasing {
+				st.volume = float64(v)
 			}
 		})
 	}()
@@ -447,18 +816,23 @@ func (s *store) readVolume() {
 
 // MARK: DDC/CI
 
-// probeDDC looks for DDC/CI on the monitor, in the background. A monitor
+// probeDDC looks for DDC/CI on the target, in the background. A monitor
 // that doesn't answer simply gets no DDC controls.
-func (s *store) probeDDC() {
-	if s.probingDDC {
+func (s *store) probeDDC() { s.startDDC(s.targetState()) }
+
+func (s *store) startDDC(st *displayState) {
+	if st.ddcStarted || st.monitor.Builtin {
+		if st.monitor.Builtin {
+			st.probingDDC = false
+		}
 		return
 	}
-	s.probingDDC = true
-	if old := s.ddc; old != nil {
-		s.ddc = nil
+	st.ddcStarted, st.probingDDC = true, true
+	if old := st.ddc; old != nil {
+		st.ddc = nil
 		go old.Close()
 	}
-	m := s.monitor
+	m, gen := st.monitor, st.gen
 	go func() {
 		d, err := m.OpenDDC()
 		var r ddcReading
@@ -466,11 +840,72 @@ func (s *store) probeDDC() {
 			r = readDDC(d, m.Name, true)
 		}
 		s.post(func() {
-			s.probingDDC = false
-			s.ddc = d
-			s.applyDDC(r)
+			if s.displays[st.id] != st || st.gen != gen {
+				if d != nil {
+					go d.Close()
+				}
+				return
+			}
+			st.ddcStarted, st.probingDDC = false, false
+			st.hardwareError = err
+			st.ddc = d
+			s.applyDDCFor(st, r)
+			s.autoCheck()
 		})
 	}()
+}
+
+// probeJob is one non-target display's pending probe, taken on the main
+// thread so the background goroutine doesn't read state it could change.
+type probeJob struct {
+	st      *displayState
+	gen     int
+	monitor display.Monitor
+	cached  string
+	taken   map[string]bool
+	ddc     bool
+	lan     bool
+}
+
+// probeStateSync looks for a non-target's channels on its own goroutine, one
+// display after another: DDC/CI is slow, and the panel stays responsive.
+func (s *store) probeStateSync(j probeJob) {
+	st := j.st
+	if j.ddc {
+		d, err := j.monitor.OpenDDC()
+		var r ddcReading
+		if err == nil {
+			r = readDDC(d, j.monitor.Name, true)
+		}
+		s.post(func() {
+			if s.displays[st.id] != st || st.gen != j.gen {
+				if d != nil {
+					go d.Close()
+				}
+				return
+			}
+			st.ddcStarted, st.probingDDC = false, false
+			st.hardwareError, st.ddc = err, d
+			s.applyDDCFor(st, r)
+			s.autoCheck()
+		})
+	}
+	if j.lan {
+		link, sources, volume, volumeErr, devices := s.connectDevice(j.monitor, j.cached, j.taken)
+		s.post(func() {
+			if devices != nil {
+				s.devices = devices
+			}
+			if s.displays[st.id] != st || st.gen != j.gen {
+				if link != nil {
+					go link.Close()
+				}
+				return
+			}
+			st.lanStarted, st.detecting = false, false
+			s.applyLink(st, link, sources, volume, volumeErr)
+		})
+	}
 }
 
 // ddcReading is what the monitor reported over DDC/CI.
@@ -501,45 +936,47 @@ func readDDC(d *display.DDC, model string, all bool) ddcReading {
 	return r
 }
 
-func (s *store) applyDDC(r ddcReading) {
-	if s.ddc == nil {
-		s.hasBrightness, s.ddcVolume, s.ddcInputs, s.controls = false, false, nil, nil
+func (s *store) applyDDC(r ddcReading) { s.applyDDCFor(s.targetState(), r) }
+
+func (s *store) applyDDCFor(st *displayState, r ddcReading) {
+	if st.ddc == nil {
+		st.hasBrightness, st.ddcVolume, st.ddcInputs, st.controls = false, false, nil, nil
 		return
 	}
-	if s.maxima == nil {
-		s.maxima = map[byte]int{}
+	if st.maxima == nil {
+		st.maxima = map[byte]int{}
 	}
 	for code, v := range r.values {
-		s.maxima[code] = v[1]
+		st.maxima[code] = v[1]
 	}
 	percent := func(code byte) (float64, bool) {
 		v, ok := r.values[code]
 		return float64(v[0]) * 100 / float64(v[1]), ok
 	}
 	if v, ok := percent(display.VCPBrightness); ok {
-		s.brightness, s.hasBrightness = v, true
+		st.brightness, st.hasBrightness = v, true
 	}
 	if v, ok := percent(display.VCPVolume); ok {
-		s.ddcVolume = true
-		if s.link == nil && !s.chasing {
-			s.volume, s.hasVolume = v, true
+		st.ddcVolume = true
+		if st.link == nil && !st.chasing {
+			st.volume, st.hasVolume = v, true
 		}
 	}
 	if r.refreshed {
-		s.applyInput(r)
-		for i := range s.controls {
-			if v, ok := r.values[s.controls[i].code]; ok {
-				s.controls[i].value = float64(v[0])
+		s.applyInputFor(st, r)
+		for i := range st.controls {
+			if v, ok := r.values[st.controls[i].code]; ok {
+				st.controls[i].value = float64(v[0])
 			}
 		}
 		return
 	}
-	s.ddcInputs = r.inputs
-	s.applyInput(r)
-	s.controls = nil
+	st.ddcInputs = r.inputs
+	s.applyInputFor(st, r)
+	st.controls = nil
 	for _, c := range controlCatalog {
 		if v, ok := r.values[c.code]; ok {
-			s.controls = append(s.controls, control{code: c.code, label: c.label, value: float64(v[0]), max: v[1]})
+			st.controls = append(st.controls, control{code: c.code, label: c.label, value: float64(v[0]), max: v[1]})
 		}
 	}
 }
@@ -547,84 +984,99 @@ func (s *store) applyDDC(r ddcReading) {
 // applyInput highlights the input the monitor reports, when it is one of
 // those it lists. Some report something else (issue #2: 8 where it lists
 // 0x0F 0x10 0x11 0x12): the input chosen in the app stays highlighted then.
-func (s *store) applyInput(r ddcReading) {
+func (s *store) applyInput(r ddcReading) { s.applyInputFor(s.targetState(), r) }
+
+func (s *store) applyInputFor(st *displayState, r ddcReading) {
 	v, ok := r.values[display.VCPInput]
-	if !ok || s.link != nil {
+	if !ok || st.link != nil {
 		return
 	}
 	code := v[0] & 0xFF // some monitors put more in the high byte
-	for _, src := range s.ddcInputs {
+	for _, src := range st.ddcInputs {
 		if src.ID == code {
-			s.input = code
+			st.input = code
 		}
 	}
 }
 
 // refreshDDC rereads the values the monitor's own buttons may have changed.
-func (s *store) refreshDDC() {
-	d := s.ddc
-	if d == nil || s.probingDDC {
+func (s *store) refreshDDC() { s.refreshDDCFor(s.targetState()) }
+
+func (s *store) refreshDDCFor(st *displayState) {
+	d := st.ddc
+	if d == nil || st.probingDDC {
 		return
 	}
-	model := s.monitor.Name
+	model := st.monitor.Name
 	go func() {
 		r := readDDC(d, model, false)
 		s.post(func() {
-			if s.ddc == d {
-				s.applyDDC(r)
+			if s.displays[st.id] == st && st.ddc == d {
+				s.applyDDCFor(st, r)
 			}
 		})
 	}()
 }
 
 // setBrightness sets the backlight over DDC/CI.
-func (s *store) setBrightness(percent float64) {
-	s.brightness = percent
-	s.setDDC(display.VCPBrightness, percent)
+func (s *store) setBrightness(percent float64) { s.setBrightnessFor(s.targetState(), percent) }
+
+func (s *store) setBrightnessFor(st *displayState, percent float64) {
+	st.brightness = percent
+	s.setDDCFor(st, display.VCPBrightness, percent)
 }
 
 // setDDC writes a percentage scaled to the code's range.
-func (s *store) setDDC(code byte, percent float64) {
-	if s.ddc == nil {
+func (s *store) setDDC(code byte, percent float64) { s.setDDCFor(s.targetState(), code, percent) }
+
+func (s *store) setDDCFor(st *displayState, code byte, percent float64) {
+	if st.ddc == nil {
 		return
 	}
-	max := s.maxima[code]
+	max := st.maxima[code]
 	if max == 0 {
 		max = 100
 	}
-	s.ddc.Set(code, int(math.Round(percent/100*float64(max))))
+	st.ddc.Set(code, int(math.Round(percent/100*float64(max))))
 }
 
-func (s *store) setControl(i int) {
-	if s.ddc != nil {
-		s.ddc.Set(s.controls[i].code, int(math.Round(s.controls[i].value)))
+func (s *store) setControl(i int) { s.setControlFor(s.targetState(), i) }
+
+func (s *store) setControlFor(st *displayState, i int) {
+	if st.ddc != nil && i >= 0 && i < len(st.controls) {
+		st.ddc.Set(st.controls[i].code, int(math.Round(st.controls[i].value)))
 	}
 }
 
 // MARK: Day and night
 
-// autoCheck applies the day or night scene when the period changed since
-// the last one applied, so manual changes stay until the next switch.
+// autoCheck applies the day or night scene to every monitor that switches by
+// the time, when the period changed since its last one, so manual changes
+// stay until the next switch.
 func (s *store) autoCheck() {
-	if !s.prefs.AutoSwitch {
-		return
-	}
 	period, _ := s.autoTimes().At(s.now())
-	if string(period) == s.prefs.AutoPeriod {
-		return
+	for _, st := range s.stateList() {
+		// Until DDC/CI has answered, a scene's brightness would be software
+		// dimming instead of the backlight; the probe calls autoCheck again.
+		if st.probingDDC || !st.prefs.AutoSwitch || string(period) == st.prefs.AutoPeriod {
+			continue
+		}
+		id := st.prefs.DayScene
+		if period == schedule.Night {
+			id = st.prefs.NightScene
+		}
+		s.applyTo(st, sceneByID(id))
+		st.prefs.AutoPeriod, s.dirty = string(period), true
 	}
-	id := s.prefs.DayScene
-	if period == schedule.Night {
-		id = s.prefs.NightScene
-	}
-	s.apply(sceneByID(id))
-	s.prefs.AutoPeriod, s.dirty = string(period), true
 }
 
-// autoChanged takes new settings: the current period's scene applies now.
+// autoChanged takes new settings: the current period's scenes apply now.
 func (s *store) autoChanged() {
 	s.prefs.DayStart, s.prefs.NightStart = s.dayStart.Format("15:04"), s.nightStart.Format("15:04")
-	s.prefs.AutoPeriod, s.dirty = "", true
+	for _, st := range s.stateList() {
+		st.prefs.AutoPeriod = ""
+	}
+	s.dirty = true
 	s.autoCheck()
 }
 
@@ -635,13 +1087,14 @@ func (s *store) autoTimes() schedule.Times {
 	}
 }
 
-// autoStatus says what is on and what comes next.
+// autoStatus says what is on and what comes next for the target.
 func (s *store) autoStatus() string {
+	st := s.targetState()
 	period, next := s.autoTimes().At(s.now())
 	if period == schedule.Day {
-		return locales.AutoNowDay(next, sceneByID(s.prefs.NightScene).label())
+		return locales.AutoNowDay(next, sceneByID(st.prefs.NightScene).label())
 	}
-	return locales.AutoNowNight(next, sceneByID(s.prefs.DayScene).label())
+	return locales.AutoNowNight(next, sceneByID(st.prefs.DayScene).label())
 }
 
 // parseClock reads "15:04" into a time of day, or the fallback minutes.
@@ -657,44 +1110,66 @@ func parseClock(text string, fallback int) time.Time {
 
 // canFollow tells whether following the built-in display is possible: a
 // MacBook's display to follow, and a backlight to set over DDC/CI.
-func (s *store) canFollow() bool { return s.hasBuiltin && s.hasBrightness }
+func (s *store) canFollow() bool { return s.canFollowFor(s.targetState()) }
+
+func (s *store) canFollowFor(st *displayState) bool {
+	return s.hasBuiltin && st.hasBrightness && !st.monitor.Builtin
+}
+
+// following reports any monitor set to follow the built-in display.
+func (s *store) following() bool {
+	for _, st := range s.stateList() {
+		if st.prefs.FollowBuiltin && s.canFollowFor(st) {
+			return true
+		}
+	}
+	return false
+}
 
 // followTick runs every second. A change of the built-in display's
-// brightness sets a new target, which the backlight eases toward; between
+// brightness sets a new target, which each backlight eases toward; between
 // changes, a manual change of the backlight stays.
 func (s *store) followTick(builtin func() (float64, bool)) {
-	if !s.prefs.FollowBuiltin || !s.canFollow() {
-		return
-	}
 	b, ok := builtin()
 	if !ok {
 		return
 	}
-	if s.lastBuiltin < 0 || math.Abs(b-s.lastBuiltin) >= 0.005 {
-		s.lastBuiltin = b
-		s.followTarget, s.easing = followTarget(b, s.prefs.FollowMin, s.prefs.FollowMax), true
+	for _, st := range s.stateList() {
+		if st.prefs.FollowBuiltin && s.canFollowFor(st) {
+			s.followState(st, b)
+		}
 	}
-	if !s.easing {
+}
+
+func (s *store) followState(st *displayState, b float64) {
+	if st.lastBuiltin < 0 || math.Abs(b-st.lastBuiltin) >= 0.005 {
+		st.lastBuiltin = b
+		st.followTarget, st.easing = followTarget(b, st.prefs.FollowMin, st.prefs.FollowMax), true
+	}
+	if !st.easing {
 		return
 	}
-	if s.prefs.SoftBrightness < 100 { // following sets the backlight alone, with no software dimming
-		s.prefs.SoftBrightness = 100
-		s.applyGamma()
+	if st.prefs.SoftBrightness < 100 { // following sets the backlight alone, with no software dimming
+		st.prefs.SoftBrightness = 100
+		s.applyGammaFor(st)
 	}
-	next := easeToward(s.brightness, s.followTarget)
-	if math.Round(next) != math.Round(s.brightness) {
-		s.setBrightness(next)
+	next := easeToward(st.brightness, st.followTarget)
+	if math.Round(next) != math.Round(st.brightness) {
+		s.setBrightnessFor(st, next)
 	} else {
-		s.brightness = next
+		st.brightness = next
 	}
-	if next == s.followTarget {
-		s.easing = false
+	if next == st.followTarget {
+		st.easing = false
 	}
 }
 
 // followChanged restarts following from the built-in display's brightness.
 func (s *store) followChanged() {
-	s.lastBuiltin, s.dirty = -1, true
+	for _, st := range s.stateList() {
+		st.lastBuiltin = -1
+	}
+	s.dirty = true
 }
 
 // followTarget maps the built-in display's brightness, 0...1, into the
@@ -779,31 +1254,40 @@ func (s *store) installUpdate() {
 // MARK: Display modes
 
 func (s *store) applyMode(m display.Mode) {
-	if err := s.monitor.Apply(m); err != nil {
+	st := s.targetState()
+	if err := st.monitor.Apply(m); err != nil {
 		s.notice = locales.NoticeModeRejected()
 	} else {
 		s.notice = locales.NoticeModeSwitched(m.Title(), m.RefreshRate)
 	}
-	s.refreshDisplay()
+	s.refreshState(st)
+}
+
+// refreshState rereads a monitor's modes and current mode.
+func (s *store) refreshState(st *displayState) {
+	st.modes = st.monitor.Modes()
+	st.current, st.hasCurrent = st.monitor.CurrentMode()
 }
 
 // competitive reports the monitor in its 1080p 320Hz mode: only then does
 // the system offer rates above the 160Hz of 4K.
 func (s *store) competitive() bool {
-	return slices.ContainsFunc(s.modes, func(m display.Mode) bool { return m.RefreshRate > 160 })
+	st := s.targetState()
+	return slices.ContainsFunc(st.modes, func(m display.Mode) bool { return m.RefreshRate > 160 })
 }
 
 // setCompetitive switches the monitor between 4K 160Hz and 1080p 320Hz
 // through the LAN remote. The system follows once the monitor offers its
 // new EDID, some seconds later.
 func (s *store) setCompetitive(on bool) {
-	link := s.link
-	if link == nil || s.switchingTo != "" || on == s.competitive() {
+	st := s.targetState()
+	link := st.link
+	if link == nil || st.switchingTo != "" || on == s.competitive() {
 		return
 	}
-	s.switchingTo = "4K 160Hz"
+	st.switchingTo = "4K 160Hz"
 	if on {
-		s.switchingTo = "1080p 320Hz"
+		st.switchingTo = "1080p 320Hz"
 	}
 	s.notice = ""
 	go func() {
@@ -812,9 +1296,9 @@ func (s *store) setCompetitive(on bool) {
 			if err != nil {
 				s.notice = locales.NoticeSwitchFailed()
 			} else {
-				s.notice = locales.NoticeSwitching(s.switchingTo)
+				s.notice = locales.NoticeSwitching(st.switchingTo)
 			}
-			s.switchingTo = ""
+			st.switchingTo = ""
 		})
 	}()
 }
@@ -823,49 +1307,242 @@ func (s *store) sleepDisplay() { _ = display.SleepNow() }
 
 // MARK: Lifecycle
 
-func (s *store) refreshDisplay() {
-	_, s.hasBuiltin = display.BuiltinBrightness()
-	s.monitor = display.Target()
-	s.modes = s.monitor.Modes()
-	s.current, s.hasCurrent = s.monitor.CurrentMode()
+// monitorKey is the identity a monitor's settings are kept under: its own,
+// or the panel's when the platform gave none.
+func monitorKey(m display.Monitor) string {
+	if m.Identity != "" {
+		return m.Identity
+	}
+	if m.Builtin {
+		return "builtin"
+	}
+	return m.BaseIdentity()
+}
+
+// assignPrefs gives each online monitor the record it is: the exact identity,
+// else the only saved record of the same panel (a display that was saved with
+// a port key while another of its model was online). Displays without one get
+// defaults. One saved record is never given to two online displays.
+func (s *store) assignPrefs(monitors []display.Monitor) map[string]*monitorPrefs {
+	out := map[string]*monitorPrefs{}
+	used := map[string]bool{}
+	for _, m := range monitors {
+		key := monitorKey(m)
+		if m.Builtin {
+			if s.builtinPrefs == nil {
+				if p := s.prefs.Monitors[key]; p != nil {
+					s.builtinPrefs = p
+				} else {
+					p := s.prefs.monitor(key)
+					s.builtinPrefs, s.dirty = p, true
+				}
+			}
+			out[key] = s.builtinPrefs
+			continue
+		}
+		if p := s.prefs.Monitors[key]; p != nil && !used[key] {
+			out[key], used[key] = p, true
+			continue
+		}
+		var saved []string
+		for id := range s.prefs.Monitors {
+			if !used[id] {
+				saved = append(saved, id)
+			}
+		}
+		if match := display.MatchIdentity(key, saved); match != "" {
+			out[key] = s.prefs.Monitors[match]
+			used[match] = true
+			continue
+		}
+		p := s.prefs.monitor(key)
+		out[key], used[key], s.dirty = p, true, true
+	}
+	return out
+}
+
+// refreshDisplays rebuilds the monitor list after a display was plugged,
+// unplugged or woke: states stay for the monitors still online, and the
+// target follows the user's choice when it is back.
+func (s *store) refreshDisplays() {
+	all, target, builtinBrightness := s.allDisplays, s.targetDisplay, s.builtinBrightness
+	if all == nil {
+		all = display.All
+	}
+	if target == nil {
+		target = display.Target
+	}
+	if builtinBrightness == nil {
+		builtinBrightness = display.BuiltinBrightness
+	}
+	_, s.hasBuiltin = builtinBrightness()
+	monitors := all()
+	external := len(monitors) > 0
+	if !external {
+		monitors = []display.Monitor{target()}
+		s.syncLegacy()
+	}
+	if external && s.prefs.needsMigration() {
+		s.syncLegacy()
+		if s.prefs.adoptLegacy(monitors[0].Identity) {
+			s.dirty = true
+			s.builtinPrefs = s.prefs.Monitors["builtin"]
+		}
+	}
+	assigned := s.assignPrefs(monitors)
+	next := map[string]*displayState{}
+	var order []string
+	for _, m := range monitors {
+		key := monitorKey(m)
+		id := key
+		if _, dup := next[id]; dup {
+			// Two displays the platform could not tell apart: keep their
+			// states apart, but they share the only settings record there is.
+			id = fmt.Sprintf("%s#%d", id, len(order))
+		}
+		st := s.displays[id]
+		if st == nil {
+			st = &displayState{id: id, probingDDC: !m.Builtin, detecting: !m.Builtin, lastBuiltin: -1}
+		}
+		changed := !st.monitor.Same(m)
+		st.id, st.monitor = id, m
+		st.prefs = assigned[key]
+		// Modes can change without the handle changing (a resolution changed
+		// elsewhere); a refresh is rare enough to reread them.
+		st.modes = m.Modes()
+		st.current, st.hasCurrent = m.CurrentMode()
+		if changed {
+			st.gen++
+			st.ddcStarted, st.lanStarted = false, false
+			st.probingDDC, st.detecting = !m.Builtin, !m.Builtin
+		}
+		next[id], order = st, append(order, id)
+	}
+	for id, old := range s.displays {
+		if next[id] == old {
+			continue
+		}
+		if old.ddc != nil {
+			go old.ddc.Close()
+		}
+	}
+	s.displays, s.order = next, order
+	s.targetID = chooseTarget(order, s.prefs.Selected, s.targetID)
+}
+
+// chooseTarget picks the monitor the panel opens on: the one the user last
+// chose when it is online, else the current fallback when it still is, else
+// the first in the system's order. The saved choice is not overwritten by a
+// fallback: the monitor comes back selected.
+func chooseTarget(order []string, selected, current string) string {
+	for _, id := range order {
+		if id == selected {
+			return selected
+		}
+	}
+	for _, id := range order {
+		if id == current {
+			return current
+		}
+	}
+	if len(order) > 0 {
+		return order[0]
+	}
+	return ""
+}
+
+// syncLegacy copies the built-in display's choices into the version 1 flat
+// fields, which an older build still reads after a rollback.
+func (s *store) syncLegacy() {
+	if s.builtinPrefs == nil {
+		return
+	}
+	p := s.builtinPrefs
+	s.prefs.SoftBrightness, s.prefs.Warmth = p.SoftBrightness, p.Warmth
+	s.prefs.NetworkHost = p.NetworkHost
+	s.prefs.FollowBuiltin, s.prefs.FollowMin, s.prefs.FollowMax = p.FollowBuiltin, p.FollowMin, p.FollowMax
+	s.prefs.AutoSwitch, s.prefs.DayScene, s.prefs.NightScene, s.prefs.AutoPeriod =
+		p.AutoSwitch, p.DayScene, p.NightScene, p.AutoPeriod
 }
 
 // displaysChanged follows plugging, mode changes and wake: the gamma table
-// was reset, so capture it again and reapply.
+// was reset and AV services may be stale, so capture and bind them again.
 func (s *store) displaysChanged() {
-	previous := s.monitor
-	s.refreshDisplay()
-	display.ResetGammaBase()
-	s.applyGamma()
-	if s.monitor != previous {
-		s.probeDDC()
+	for _, st := range s.stateList() {
+		display.ResetGammaBase(st.monitor)
 	}
+	display.ResetDDCBinding()
+	s.refreshDisplays()
+	for _, st := range s.stateList() {
+		s.applyGammaFor(st)
+	}
+	s.detect()
+	// A display that comes back whose last period is the other one catches
+	// up at once, not at the next timer tick.
+	s.autoCheck()
 }
 
 func (s *store) panelOpened() {
 	s.usage = s.tracker.Recent(7)
+	st := s.targetState()
 	// Retry here too: the launch attempt may have raced the network
 	// permission prompt.
-	if s.link == nil {
-		s.connect()
+	if st.link == nil && !st.monitor.Builtin {
+		s.startLAN(st)
 	} else {
-		s.readVolume()
+		s.readVolumeFor(st)
 	}
-	s.refreshDDC()
+	s.refreshDDCFor(st)
 }
 
-// detect looks for every control channel again.
+// detect looks for every control channel again: the target at once, the
+// other displays serially in the background.
 func (s *store) detect() {
-	s.connect()
-	s.probeDDC()
+	target := s.targetState()
+	s.detectState(target)
+	var jobs []probeJob
+	for _, id := range s.order {
+		if id == target.id {
+			continue
+		}
+		st := s.displays[id]
+		if st == nil || st.monitor.Builtin {
+			continue
+		}
+		j := probeJob{st: st, gen: st.gen, monitor: st.monitor, cached: st.prefs.NetworkHost, taken: s.takenHosts(st.id)}
+		if !st.ddcStarted {
+			st.ddcStarted, st.probingDDC, j.ddc = true, true, true
+		}
+		if !st.lanStarted {
+			st.lanStarted, st.detecting, j.lan = true, true, true
+		}
+		if j.ddc || j.lan {
+			jobs = append(jobs, j)
+		}
+	}
+	go func() {
+		for _, j := range jobs {
+			s.probeStateSync(j)
+		}
+	}()
 }
 
-// detectingAny reports a channel still being looked for.
-func (s *store) detectingAny() bool { return s.detecting || s.probingDDC }
+// detectState looks for one display's channels, without blocking the panel.
+func (s *store) detectState(st *displayState) {
+	s.startLAN(st)
+	s.startDDC(st)
+}
 
 func (s *store) recordUsage() {
 	s.autoCheck()
-	s.tracker.Record(!s.monitor.Asleep(), time.Duration(display.IdleSeconds()*float64(time.Second)))
+	lit := false
+	for _, st := range s.stateList() {
+		if !st.monitor.Asleep() {
+			lit = true
+			break
+		}
+	}
+	s.tracker.Record(lit, time.Duration(display.IdleSeconds()*float64(time.Second)))
 	s.usage = s.tracker.Recent(7)
 	s.save()
 }
@@ -878,6 +1555,9 @@ func (s *store) toggleLaunchAtLogin() {
 }
 
 func (s *store) save() {
+	if s.prefs.needsMigration() {
+		s.syncLegacy()
+	}
 	if s.dirty {
 		s.prefs.save()
 		s.dirty = false

@@ -46,6 +46,13 @@ func New(host string) *Link {
 	return &Link{Host: host, client: &http.Client{Timeout: 4 * time.Second}}
 }
 
+// Close releases the link's idle connections.
+func (l *Link) Close() {
+	if l.client != nil {
+		l.client.CloseIdleConnections()
+	}
+}
+
 // DeviceName answers whether the device is reachable, with its name.
 func (l *Link) DeviceName() (string, error) {
 	var data struct {

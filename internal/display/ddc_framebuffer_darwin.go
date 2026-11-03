@@ -4,7 +4,6 @@ package display
 
 import (
 	"bytes"
-	"errors"
 	"runtime"
 	"time"
 	"unsafe"
@@ -172,7 +171,7 @@ func (m Monitor) framebufferDDC() (ddcTransport, error) {
 	load()
 	var iter uint32
 	if ioServiceGetMatchingServices(0, ioServiceMatching("IOFramebuffer"), &iter) != 0 {
-		return nil, errors.New("display: no framebuffers")
+		return nil, ErrNoHardwareControl
 	}
 	defer ioObjectRelease(iter)
 	vendor, product, serial := cgDisplayVendorNumber(m.handle), cgDisplayModelNumber(m.handle), cgDisplaySerialNumber(m.handle)
@@ -202,7 +201,7 @@ func (m Monitor) framebufferDDC() (ddcTransport, error) {
 		}
 		ioObjectRelease(entry)
 	}
-	return nil, errors.New("display: no framebuffer I2C bus")
+	return nil, ErrNoHardwareControl
 }
 
 // sameDisplay compares a framebuffer's EDID identity with the display's.

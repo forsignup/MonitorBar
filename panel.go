@@ -111,7 +111,7 @@ func (p *panel) header(c *ui.Context) {
 			icon(c, "display").FontSize(15).TextColor(ui.RGB(255, 255, 255))
 		})
 		ui.Column(c).Gap(3).Grow(1).Children(func() {
-			ui.Text(c, or(s.monitor.Name, locales.MonitorUnnamed())).FontSize(16).FontWeight(600).LetterSpacing(-0.3).SingleLine()
+			p.title(c)
 			ui.Text(c, p.caption()).FontSize(10).FontWeight(500).TextColor(muted)
 		})
 		ui.Box(c).Size(24, 30).Center().TextColor(muted).Label(locales.MenuMore()).Cursor(ui.CursorPointer).Children(func() {
@@ -160,17 +160,44 @@ func (p *panel) header(c *ui.Context) {
 	})
 }
 
+// title names the target; with several displays it opens the switcher.
+func (p *panel) title(c *ui.Context) {
+	s := p.s
+	name := or(s.targetState().monitor.Name, locales.MonitorUnnamed())
+	if s.displayCount() <= 1 {
+		ui.Text(c, name).FontSize(16).FontWeight(600).LetterSpacing(-0.3).SingleLine()
+		return
+	}
+	row := ui.Row(c).Gap(3).AlignItems(ui.Center).Cursor(ui.CursorPointer).Tooltip(locales.SwitchDisplay()).Menu(func(m *ui.Menu) {
+		for _, id := range s.order {
+			st := s.displays[id]
+			if st == nil {
+				continue
+			}
+			if m.Item(s.switcherLabel(id)).Checked(id == s.targetID).Chosen() {
+				s.selectTarget(id)
+			}
+		}
+	})
+	row.Children(func() {
+		ui.Text(c, name).FontSize(16).FontWeight(600).LetterSpacing(-0.3).SingleLine()
+		icon(c, "chevron").FontSize(10).TextColor(muted)
+	})
+}
+
 // caption sums the monitor up: "External display · HDMI · 4K · 160Hz".
 func (p *panel) caption() string {
+	s := p.s
+	st := s.targetState()
 	parts := []string{locales.CaptionExternal()}
-	if p.s.monitor.Connection != "" {
-		parts = append(parts, p.s.monitor.Connection)
+	if st.monitor.Connection != "" {
+		parts = append(parts, st.monitor.Connection)
 	}
-	if label := display.SizeLabel(p.s.monitor.NativeSize(p.s.modes, p.s.current)); label != "" {
+	if label := display.SizeLabel(st.monitor.NativeSize(st.modes, st.current)); label != "" {
 		parts = append(parts, label)
 	}
-	if p.s.hasCurrent { // the current refresh rate, not the fastest of any mode (issue #2)
-		parts = append(parts, strconv.Itoa(p.s.current.RefreshRate)+"Hz")
+	if st.hasCurrent { // the current refresh rate, not the fastest of any mode (issue #2)
+		parts = append(parts, strconv.Itoa(st.current.RefreshRate)+"Hz")
 	}
 	return strings.Join(parts, " · ")
 }
@@ -259,33 +286,38 @@ func (p *panel) updateBar(c *ui.Context) {
 	})
 }
 
-// footer tells which channels reach the monitor. With none, it says
-// nothing: software dimming needs no explaining.
+// footer tells which channels reach the target. With one display and none,
+// it says nothing: software dimming needs no explaining. With several it
+// does say when this one has no hardware channel, so the others' don't
+// mislead.
 func (p *panel) footer(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	text := ""
 	switch {
-	case s.link != nil && s.ddc != nil:
+	case st.link != nil && st.ddc != nil:
 		text = locales.FooterLanAndDdc()
-	case s.link != nil:
+	case st.link != nil:
 		text = locales.FooterLan()
-	case s.ddc != nil:
+	case st.ddc != nil:
 		text = locales.FooterDdc()
-	case s.detectingAny():
+	case st.detecting || st.probingDDC:
 		text = locales.FooterDetecting()
+	case s.displayCount() > 1:
+		text = locales.FooterSoftware()
 	}
 	if text == "" {
 		ui.Box(c).Height(12)
 		return
 	}
 	dot := ui.RGB(52, 199, 89)
-	if s.link == nil && s.ddc == nil {
+	if st.link == nil && st.ddc == nil {
 		dot = ui.RGB(255, 204, 0)
 	}
 	ui.Row(c).Gap(6).Padding(12, 0).Children(func() {
 		ui.Box(c).Size(6, 6).Radius(3).Background(dot)
 		ui.Text(c, text).FontSize(10).TextColor(muted).Grow(1)
-		if s.detectingAny() {
+		if st.detecting || st.probingDDC {
 			ui.Spinner(c).Size(12, 12)
 		}
 	})

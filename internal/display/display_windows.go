@@ -4,10 +4,13 @@ package display
 
 import (
 	"errors"
+	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 // SettingsURL opens the Display page of Windows Settings.
@@ -129,6 +132,7 @@ const (
 	enumCurrentSettings  = 0xFFFFFFFF
 	attachedToDesktop    = 0x1
 	primaryDevice        = 0x4
+	mirroringDriver      = 0x8
 	dmInterlaced         = 0x2
 	qdcOnlyActivePaths   = 0x2
 	getSourceName        = 1
@@ -139,30 +143,31 @@ const (
 	dmFieldsForMode      = 0x40000 | 0x80000 | 0x100000 | 0x400000 // bits per pixel, width, height, frequency
 )
 
+// All returns the external displays, the main one first and the others from
+// left to right, as Windows Settings lists them. Indirect displays
+// (DisplayLink, remote desktops) are not managed.
+func All() []Monitor {
+	monitors := attachedDisplays()
+	external := monitors[:0]
+	for _, m := range monitors {
+		if !m.Builtin && !m.virtual {
+			external = append(external, m)
+		}
+	}
+	assignIdentities(external)
+	return external
+}
+
 // Target returns the external display, the primary one if several are; a
 // laptop's own panel only when no external one is on, as on macOS.
 func Target() Monitor {
-	var best Monitor
-	bestRank := -1
-	for i := uint32(0); ; i++ {
-		var dd displayDevice
-		dd.Size = uint32(unsafe.Sizeof(dd))
-		if r, _, _ := procEnumDisplayDevices.Call(0, uintptr(i), uintptr(unsafe.Pointer(&dd)), 0); r == 0 {
-			break
-		}
-		if dd.StateFlags&attachedToDesktop == 0 {
-			continue
-		}
-		m := Monitor{handle: windows.UTF16ToString(dd.DeviceName[:])}
-		m.Name, m.Connection, m.NativeWidth, m.NativeHeight, m.Builtin = targetInfo(m.handle)
-		if m.Name == "" {
-			m.Name = monitorString(dd.DeviceName[:])
-		}
+	best, bestRank := Monitor{}, -1
+	for _, m := range attachedDisplays() {
 		rank := 0
-		if !m.Builtin {
+		if !m.Builtin && !m.virtual {
 			rank += 2
 		}
-		if dd.StateFlags&primaryDevice != 0 {
+		if m.Primary {
 			rank++
 		}
 		if rank > bestRank {
@@ -172,20 +177,63 @@ func Target() Monitor {
 	return best
 }
 
+// attachedDisplays lists every display Windows has attached, built-in ones
+// included: Target needs those when no external one is on.
+func attachedDisplays() []Monitor {
+	var out []Monitor
+	for i := uint32(0); ; i++ {
+		var dd displayDevice
+		dd.Size = uint32(unsafe.Sizeof(dd))
+		if r, _, _ := procEnumDisplayDevices.Call(0, uintptr(i), uintptr(unsafe.Pointer(&dd)), 0); r == 0 {
+			break
+		}
+		if dd.StateFlags&attachedToDesktop == 0 || dd.StateFlags&mirroringDriver != 0 {
+			continue
+		}
+		m := Monitor{handle: windows.UTF16ToString(dd.DeviceName[:]), Primary: dd.StateFlags&primaryDevice != 0}
+		info := targetInfo(m.handle)
+		m.Name, m.Connection = info.name, info.connection
+		m.NativeWidth, m.NativeHeight = info.width, info.height
+		m.Builtin, m.virtual = info.internal, info.virtual
+		if m.Name == "" {
+			m.Name = monitorString(dd.DeviceName[:])
+		}
+		m.Vendor, m.Model, m.Serial = info.vendor, info.model, info.serial
+		m.Position = info.devicePath
+		m.x = info.x
+		if m.Builtin {
+			m.Identity = "builtin"
+		} else {
+			m.Identity = m.edid().String()
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// displayTarget is what the display configuration says of one display.
+type displayTarget struct {
+	name, connection, devicePath string
+	width, height                int
+	vendor, model, serial        uint32
+	x                            int
+	internal, virtual            bool
+}
+
 // targetInfo finds the monitor's friendly name, cable type, preferred
-// (native) resolution and whether it is a laptop's own panel through the
-// display path whose source is the GDI device. DSR and similar list modes
-// larger than the panel; this one is not.
-func targetInfo(device string) (name, connection string, width, height int, internal bool) {
+// (native) resolution, EDID identity and whether it is a laptop's own panel
+// through the display path whose source is the GDI device. DSR and similar
+// list modes larger than the panel; this one is not.
+func targetInfo(device string) displayTarget {
 	var nPaths, nModes uint32
 	if r, _, _ := procGetDisplayConfigBufferSizes.Call(qdcOnlyActivePaths, uintptr(unsafe.Pointer(&nPaths)), uintptr(unsafe.Pointer(&nModes))); r != 0 || nPaths == 0 {
-		return "", "", 0, 0, false
+		return displayTarget{x: displayX(device)}
 	}
 	paths := make([]pathInfo, nPaths)
 	modes := make([][64]byte, max(nModes, 1))
 	if r, _, _ := procQueryDisplayConfig.Call(qdcOnlyActivePaths, uintptr(unsafe.Pointer(&nPaths)), uintptr(unsafe.Pointer(&paths[0])),
 		uintptr(unsafe.Pointer(&nModes)), uintptr(unsafe.Pointer(&modes[0])), 0); r != 0 {
-		return "", "", 0, 0, false
+		return displayTarget{x: displayX(device)}
 	}
 	for _, p := range paths[:nPaths] {
 		source := sourceDeviceName{Header: deviceInfoHeader{Type: getSourceName, Adapter: p.SourceAdapter, ID: p.SourceID}}
@@ -202,10 +250,71 @@ func targetInfo(device string) (name, connection string, width, height int, inte
 		preferred := targetPreferredMode{Header: deviceInfoHeader{Type: getPreferredMode, Adapter: p.TargetAdapter, ID: p.TargetID}}
 		preferred.Header.Size = uint32(unsafe.Sizeof(preferred))
 		procDisplayConfigGetDeviceInfo.Call(uintptr(unsafe.Pointer(&preferred)))
-		return windows.UTF16ToString(target.FriendlyName[:]), outputTechnology(target.OutputTechnology), int(preferred.Width), int(preferred.Height),
-			builtinOutput(target.OutputTechnology)
+		info := displayTarget{
+			name: windows.UTF16ToString(target.FriendlyName[:]), connection: outputTechnology(target.OutputTechnology),
+			devicePath: windows.UTF16ToString(target.DevicePath[:]), width: int(preferred.Width), height: int(preferred.Height),
+			x: displayX(device), internal: builtinOutput(target.OutputTechnology),
+			virtual: target.OutputTechnology == indirectWired || target.OutputTechnology == indirectVirtual,
+		}
+		info.vendor, info.model, info.serial = targetManufacture(target.ManufactureID), uint32(target.ProductCodeID), 0
+		if edid := monitorEDID(device); len(edid) > 0 {
+			if v, m, s, ok := parseEDID(edid); ok {
+				info.vendor, info.model, info.serial = v, m, s
+			}
+		}
+		return info
 	}
-	return "", "", 0, 0, false
+	return displayTarget{x: displayX(device)}
+}
+
+// indirectWired and indirectVirtual are DisplayLink and remote-desktop
+// displays: not physical panels on a cable of their own.
+const (
+	indirectWired   = 0xB
+	indirectVirtual = 0xC
+)
+
+// displayX is the display's left edge in the desktop's virtual coordinates.
+func displayX(device string) int {
+	var dm devMode
+	dm.Size = uint16(unsafe.Sizeof(dm))
+	p, _ := syscall.UTF16PtrFromString(device)
+	if r, _, _ := procEnumDisplaySettings.Call(uintptr(unsafe.Pointer(p)), enumCurrentSettings, uintptr(unsafe.Pointer(&dm))); r == 0 {
+		return 0
+	}
+	return int(dm.PositionX)
+}
+
+// targetManufacture widens the EDID's 16-bit manufacturer id to the 32-bit
+// form macOS reports.
+func targetManufacture(id uint16) uint32 { return uint32(id) }
+
+// monitorEDID reads the panel's EDID from the registry entry Windows keeps
+// for the GDI display.
+func monitorEDID(device string) []byte {
+	p, _ := syscall.UTF16PtrFromString(device)
+	var dd displayDevice
+	dd.Size = uint32(unsafe.Sizeof(dd))
+	if r, _, _ := procEnumDisplayDevices.Call(uintptr(unsafe.Pointer(p)), 0, uintptr(unsafe.Pointer(&dd)), 0); r == 0 {
+		return nil
+	}
+	key := windows.UTF16ToString(dd.DeviceKey[:])
+	for _, prefix := range []string{`\Registry\Machine\`, `\Registry\Machine`, `\`} {
+		key = strings.TrimPrefix(key, prefix)
+	}
+	if key == "" {
+		return nil
+	}
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, key+`\Device Parameters`, registry.QUERY_VALUE)
+	if err != nil {
+		return nil
+	}
+	defer k.Close()
+	edid, _, err := k.GetBinaryValue("EDID")
+	if err != nil {
+		return nil
+	}
+	return edid
 }
 
 func outputTechnology(t uint32) string {
@@ -294,7 +403,10 @@ var identity = func() (r gammaRamp) {
 	return r
 }()
 
-var gammaDevice string // the display last dimmed, for RestoreGamma
+var (
+	gammaMu      sync.Mutex
+	gammaDevices = map[string]string{} // each dimmed display, for RestoreAllGamma
+)
 
 // SetGamma dims and warms the picture through the gamma ramp.
 func (m Monitor) SetGamma(brightness, warmth float64) error {
@@ -303,7 +415,10 @@ func (m Monitor) SetGamma(brightness, warmth float64) error {
 		return errors.New("display: no device context")
 	}
 	defer procDeleteDC.Call(dc)
-	gammaDevice = m.handle
+	key := m.gammaKey()
+	gammaMu.Lock()
+	gammaDevices[key] = m.handle
+	gammaMu.Unlock()
 	gr, gg, gb := gains(brightness, warmth)
 	if neutral(brightness, warmth) {
 		gr, gg, gb = 1, 1, 1
@@ -331,13 +446,36 @@ func (m Monitor) SetGamma(brightness, warmth float64) error {
 	return errors.New("display: Windows refused the gamma ramp")
 }
 
-// RestoreGamma puts the identity ramp back; Windows keeps a changed ramp
-// after the app quits.
-func RestoreGamma() {
-	if gammaDevice == "" {
+// RestoreGamma puts this display's identity ramp back; Windows keeps a
+// changed ramp after the app quits.
+func (m Monitor) RestoreGamma() {
+	gammaMu.Lock()
+	device, ok := gammaDevices[m.gammaKey()]
+	delete(gammaDevices, m.gammaKey())
+	gammaMu.Unlock()
+	if !ok {
+		device = m.handle
+	}
+	restoreRamp(device)
+}
+
+// RestoreAllGamma puts every dimmed display's identity ramp back, when the
+// app quits.
+func RestoreAllGamma() {
+	gammaMu.Lock()
+	devices := gammaDevices
+	gammaDevices = map[string]string{}
+	gammaMu.Unlock()
+	for _, device := range devices {
+		restoreRamp(device)
+	}
+}
+
+func restoreRamp(device string) {
+	if device == "" {
 		return
 	}
-	m := Monitor{handle: gammaDevice}
+	m := Monitor{handle: device}
 	if dc := m.dc(); dc != 0 {
 		ramp := identity
 		procSetDeviceGammaRamp.Call(dc, uintptr(unsafe.Pointer(&ramp)))
@@ -346,7 +484,7 @@ func RestoreGamma() {
 }
 
 // ResetGammaBase does nothing on Windows: changes start from the identity.
-func ResetGammaBase() {}
+func ResetGammaBase(Monitor) {}
 
 func (m Monitor) dc() uintptr {
 	driver, _ := syscall.UTF16PtrFromString("DISPLAY")
@@ -398,3 +536,7 @@ func SleepNow() error {
 	}
 	return nil
 }
+
+// ResetDDCBinding does nothing on Windows: DDC goes through the HMONITOR,
+// which Windows rebinds itself.
+func ResetDDCBinding() {}
