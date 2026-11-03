@@ -3,7 +3,6 @@
 package display
 
 import (
-	"errors"
 	"sync"
 	"syscall"
 	"unsafe"
@@ -79,7 +78,7 @@ func (m Monitor) ddcTransport() (ddcTransport, error) {
 		}
 		return &dxvaDDC{monitors: monitors}, nil
 	}
-	return nil, errors.New("display: no physical monitor")
+	return nil, ErrNoHardwareControl
 }
 
 func (d *dxvaDDC) read(code byte) (value, maximum int, ok bool) {

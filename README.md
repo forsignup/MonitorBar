@@ -9,6 +9,7 @@ A menu bar (macOS) and tray (Windows) app to manage your monitor — <a href="#e
 <img src="docs/screenshots/overview.png" width="270" alt="概览">
 <img src="docs/screenshots/modes.png" width="270" alt="分辨率">
 <img src="docs/screenshots/activity.png" width="270" alt="屏幕时间">
+<img src="docs/screenshots/switcher.png" width="270" alt="多台显示器">
 </p>
 
 ## 为什么做这个
@@ -19,7 +20,7 @@ Mac 上常见的显示器工具（MonitorControl、BetterDisplay、Lunar 等）�
 
 不过 REDMI 显示器内置澎湃 OS，开机时会在局域网提供一个遥控接口。MonitorBar 通过这个接口切换输入源（包括 DP 和 USB-C）、调节音量，不依赖 DDC/CI。软件调光、色温、分辨率、屏幕时间这些通用功能也一起做了进去，并且有 Mac 和 Windows 两个版本：两台电脑接在同一台显示器上时，在任意一台上都能一键切到另一台。
 
-MonitorBar 只在 REDMI 显示器 G Pro 27U 2026 上测试过，不保证在你的显示器上能正常工作：不同型号的接口、信号源编号可能不一样。如果不能用，可以借助 AI 编程工具来适配：先运行 `MonitorBar --probe` 看看它识别到了什么，再让 AI 参照下面的[适配其他显示器](#适配其他显示器)一节修改代码。
+MonitorBar 只在 REDMI 显示器 G Pro 27U 2026 上测试过，不保证在你的显示器上能正常工作：不同型号的接口、输入源编号可能不一样。如果不能用，可以借助 AI 编程工具来适配：先运行 `MonitorBar --probe` 看看它识别到了什么，再让 AI 参照下面的[适配其他显示器](#适配其他显示器)一节修改代码。
 
 ## 功能
 
@@ -31,6 +32,7 @@ MonitorBar 只在 REDMI 显示器 G Pro 27U 2026 上测试过，不保证在你�
 | 屏幕时间 | 今日亮屏与使用时长，最近 7 天柱状图 |
 
 - **切换输入源、调音量不需要 DDC/CI**：澎湃 OS 显示器（如 REDMI 显示器 G Pro 27U 2026）在局域网提供遥控接口，MonitorBar 自动发现并使用它。Mac 和 Windows 接在同一台显示器的不同接口上时，两边都能一键切到对方。
+- **多台外接显示器**：面板顶部切换目标显示器，每台的亮度、色温、场景、DDC 画面设置、输入源、音量、分辨率与自动切换各自独立，跨启动、跨重插保留；只有一台外接时界面与 1.11 完全相同。屏幕时间仍是整机口径：任意外接显示器亮着就计时。
 - **一键切换 320Hz 竞技模式**：G Pro 27U 这类双模显示器在 4K 160Hz 和 1080p 320Hz 之间切换要换 EDID，原本只能在显示器菜单里操作。连上澎湃 OS 局域网接口时，「分辨率」页一键切换，不用碰显示器；切换后系统会在几秒内重新识别显示器。
 - **支持 DDC/CI 的显示器**：自动用 DDC/CI 调硬件背光，切换输入源、调音量，并显示对比度、锐度、RGB 增益等显示器回应的设置。
 - **软件调光与色温**通过显卡的 Gamma 表实现，任何连接线、任何显示器都能用。
@@ -69,14 +71,14 @@ MonitorBar 只在 REDMI 显示器 G Pro 27U 2026 上测试过，不保证在你�
 
 ```bash
 MonitorBar --show                 # 启动并打开面板（程序已运行时，再次启动也会打开面板）
-MonitorBar --probe                # 打印显示器、接口、分辨率、DDC/CI 读数和局域网发现结果
+MonitorBar --probe                # 逐台打印显示器身份、接口、分辨率、DDC/CI 读数与局域网配对
 MonitorBar --open-at-login on     # 开机自启（off 关闭）
 MonitorBar --update               # 检查并安装新版本
 ```
 
 ## 工作原理
 
-MonitorBar 有三条控制显示器的通道，启动时在后台探测，哪条可用就用哪条：
+MonitorBar 有三条控制显示器的通道，每台显示器各自探测，哪条可用就用哪条：
 
 | 通道 | 能做什么 | 条件 |
 | --- | --- | --- |
@@ -84,20 +86,27 @@ MonitorBar 有三条控制显示器的通道，启动时在后台探测，哪条
 | DDC/CI | 硬件背光、输入源、音量、对比度等 | 显示器支持 DDC/CI（部分需在显示器菜单开启） |
 | 显卡 Gamma 表 | 软件调光、色温 | 任何显示器 |
 
-输入源和音量优先走局域网，其次 DDC/CI；亮度有 DDC/CI 时调硬件背光，否则用软件调光。
+输入源和音量优先走局域网，其次 DDC/CI；亮度有 DDC/CI 时调硬件背光，否则用软件调光。目标显示器的通道立即探测，其余显示器在后台串行探测，面板不会因此卡住。
 
-- **局域网遥控**：澎湃 OS 的 6095 端口提供 `getsources`（信号源列表）、`changesource2`（按编号切换，能切到 DP / USB-C）、`getvolume`、`keyevent`（遥控按键，音量 ±1）。首次启动扫描所在 /24 网段找到显示器，之后记住地址。
-- **DDC/CI**：macOS 通过 IOAVService 读写显示器的 I2C 总线（Apple Silicon）；Windows 通过系统的 Monitor Configuration API（dxva2）。输入源列表取自显示器的 MCCS 能力字符串。
+- **局域网遥控**：澎湃 OS 的 6095 端口提供 `getsources`（输入源列表）、`changesource2`（按编号切换，能切到 DP / USB-C）、`getvolume`、`keyevent`（遥控按键，音量 ±1）。扫描所在 /24 网段会收集所有响应的显示器，显示器名称与设备名称唯一匹配时自动配对；同名时在「概览」页手动选择，按显示器身份记住地址。
+- **DDC/CI**：macOS 通过 IOAVService 读写显示器的 I2C 总线（Apple Silicon）；每台显示器用 `IOAVServiceCopyEDID` 读到的 EDID 与系统显示的厂商 / 型号 / 序列号对应，对应不上的那台标记为「仅软件调光」，不会写到另一台的 I2C 总线上。Intel Mac 走帧缓冲的 I2C 总线。Windows 通过系统的 Monitor Configuration API（dxva2），按 `HMONITOR` 对应到物理显示器。输入源列表取自显示器的 MCCS 能力字符串。
 - **macOS**：通过 [purego](https://github.com/ebitengine/purego) 调用 CoreGraphics、IOKit、AppKit（无 cgo）。
 - **Windows**：通过 `syscall` 调用 user32、gdi32、dxva2、powrprof。
 
 ## 平台差异
 
 - **软件调光**：Windows 只接受离标准曲线不远的 Gamma（最暗约 50%），更暗时退到允许的最暗并保留色温比例，面板会提示。macOS 无此限制。退出时两端都会恢复原始曲线。
-- **跟随内屏亮度**：仅 macOS（读取 DisplayServices 的内屏亮度），且需外接显示器支持 DDC/CI 背光；Windows 暂不支持。
+- **跟随内屏亮度**：仅 macOS（读取 DisplayServices 的内屏亮度），且需外接显示器支持 DDC/CI 背光；多台外接时各自跟随、各自的范围设置生效；Windows 暂不支持。
+- **多台外接的 DDC/CI**：Apple Silicon 上按 EDID 把每台显示器绑定到自己的 AV service。同型号且序列号为 0 的两台显示器无法仅凭 EDID 区分，绑定不上的那台只提供软件调光；换接口后位置键变化，那台的历史设置也不再匹配（见「已知限制」）。
 - **亮屏统计**：macOS 读显示器休眠状态；Windows 以「空闲时长 ≥ 电源计划的关闭显示器时间」推断。
 - **面板位置**：从溢出区打开时面板贴在图标上方；拿不到图标位置时（如再次启动程序打开）贴在屏幕右下角。
 - 数据保存在 `~/Library/Application Support/MonitorBar`（macOS）或 `%APPDATA%\MonitorBar`（Windows）。
+
+## 已知限制
+
+- 同型号且序列号为 0 的显示器只能靠接口位置区分。把线换到另一个接口后，那台显示器会被当作新显示器，原来的亮度、色温、网络地址等设置不再匹配。
+- 镜像集里的副本与虚拟显示器（DisplayLink、远程桌面）不会出现在切换器里，也不被管理。
+- 首次打开面板时，非目标显示器的通道在后台探测，切换器里会短暂显示「检测中」。
 
 <p align="center"><img src="docs/screenshots/windows.png" width="300" alt="Windows 11 上的面板"><br><sub>Windows 11 上的面板</sub></p>
 
@@ -144,7 +153,7 @@ git tag v1.0.0 && git push origin v1.0.0
 
 ## English
 
-REDMI monitors do not support DDC/CI, so the usual tools (MonitorControl, BetterDisplay, Lunar) cannot switch their inputs. They run HyperOS, though, whose LAN remote API can, DP and USB-C included. MonitorBar manages an external monitor from the macOS menu bar or the Windows notification area. It switches inputs and changes volume over the LAN remote API of Xiaomi HyperOS monitors, or over DDC/CI on monitors that support it (backlight and picture controls too), dims and warms the picture through the gamma table, switches resolutions and refresh rates, and tracks screen time. Monitors with neither HyperOS nor DDC/CI work too, with fewer features: dimming, color temperature, scenes, resolutions and screen time still work, while input switching, volume and hardware backlight do not. It is one Go codebase built with [mygo](https://mygo.egoist.dev/), drawing native UI on both platforms; the Windows build cross-compiles from a Mac. See [Development](#开发) for build commands.
+REDMI monitors do not support DDC/CI, so the usual tools (MonitorControl, BetterDisplay, Lunar) cannot switch their inputs. They run HyperOS, though, whose LAN remote API can, DP and USB-C included. MonitorBar manages every external monitor from the macOS menu bar or the Windows notification area: the panel switches the target monitor, and each one keeps its own brightness, color temperature, scenes, DDC picture settings, input, volume, resolution and auto switching. Screen time stays whole-machine: any managed monitor being on counts. It switches inputs and changes volume over the LAN remote API of Xiaomi HyperOS monitors, or over DDC/CI on monitors that support it (backlight and picture controls too), dims and warms the picture through the gamma table, switches resolutions and refresh rates, and tracks screen time. Known limits: two monitors of the same model with serial number 0 are told apart by port, so moving a cable loses that monitor's settings; mirrored copies and virtual displays (DisplayLink, remote desktops) are not listed. Monitors with neither HyperOS nor DDC/CI work too, with fewer features: dimming, color temperature, scenes, resolutions and screen time still work, while input switching, volume and hardware backlight do not. It is one Go codebase built with [mygo](https://mygo.egoist.dev/), drawing native UI on both platforms; the Windows build cross-compiles from a Mac. See [Development](#开发) for build commands.
 
 ## 许可证
 

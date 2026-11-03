@@ -10,9 +10,16 @@ import (
 // the keys: step changes the external display, nil to leave the key to
 // macOS, and pass lets macOS have the key as well.
 func (s *store) mediaKey(k mediakeys.Key) (step func(), pass bool) {
+	target := s.targetState()
+	// The volume keys follow the sound, wherever it plays: a media key may
+	// set a display that isn't the target.
+	volume := s.soundDisplay()
+	if volume == nil {
+		volume = target
+	}
 	switch k {
 	case mediakeys.BrightnessUp, mediakeys.BrightnessDown:
-		if s.monitor.Builtin || s.prefs.FollowBuiltin && s.canFollow() {
+		if target.monitor.Builtin || target.prefs.FollowBuiltin && s.canFollowFor(target) {
 			return nil, false // no external display, or it follows the built-in one already
 		}
 		delta := float64(shortcutStep)
@@ -20,21 +27,21 @@ func (s *store) mediaKey(k mediakeys.Key) (step func(), pass bool) {
 			delta = -delta
 		}
 		// A MacBook's own display keeps its keys: both change together.
-		return func() { s.stepBrightness(delta); s.adjusted(hudBrightness) }, s.hasBuiltin
+		return func() { s.stepBrightnessFor(target, delta); s.adjustedFor(hudBrightness, target) }, s.hasBuiltin
 	case mediakeys.VolumeUp, mediakeys.VolumeDown:
-		if !s.hasVolume || !s.soundToDisplay() {
+		if !volume.hasVolume || !s.soundToDisplay() {
 			return nil, false // the sound plays elsewhere, at macOS's volume
 		}
 		delta := float64(shortcutStep)
 		if k == mediakeys.VolumeDown {
 			delta = -delta
 		}
-		return func() { s.stepVolume(delta); s.adjusted(hudVolume) }, false
+		return func() { s.stepVolumeFor(volume, delta); s.adjustedFor(hudVolume, volume) }, false
 	case mediakeys.Mute:
-		if !s.hasVolume || !s.soundToDisplay() {
+		if !volume.hasVolume || !s.soundToDisplay() {
 			return nil, false
 		}
-		return func() { s.toggleMute(); s.adjusted(hudVolume) }, false
+		return func() { s.toggleMuteFor(volume); s.adjustedFor(hudVolume, volume) }, false
 	}
 	return nil, false
 }

@@ -27,26 +27,52 @@ const (
 )
 
 // adjusted tells that a key just set a level, for the HUD to show it.
-func (s *store) adjusted(kind hudKind) {
-	if kind == "" || !s.prefs.HUD || kind == hudVolume && !s.hasVolume {
+func (s *store) adjusted(kind hudKind) { s.adjustedFor(kind, s.targetState()) }
+
+// adjustedFor shows a level of st: a media key may set the sound's display,
+// which is not always the target.
+func (s *store) adjustedFor(kind hudKind, st *displayState) {
+	if kind == "" || !s.prefs.HUD || kind == hudVolume && !st.hasVolume {
 		return
 	}
+	s.hudState = st
 	s.onAdjust(kind)
+}
+
+// hudDisplay is the monitor the HUD talks about: the one a key just set,
+// else the target.
+func (s *store) hudDisplay() *displayState {
+	if st := s.hudState; st != nil {
+		if s.displays[st.id] == st {
+			return st
+		}
+	}
+	return s.targetState()
 }
 
 // hudLevel is what the HUD shows for kind: its icon, title and percent.
 func (s *store) hudLevel(kind hudKind) (iconName, title string, percent float64) {
+	st := s.hudDisplay()
+	title = locales.Brightness()
 	if kind == hudVolume {
-		iconName = "volume"
-		if s.volume == 0 {
+		iconName, title = "volume", locales.Volume()
+		if st.volume == 0 {
 			iconName = "volumeOff"
 		}
-		return iconName, locales.Volume(), s.volume
+		if s.displayCount() > 1 {
+			title = st.displayName() + " · " + title
+		}
+		return iconName, title, st.volume
 	}
-	if s.hasBrightness {
-		return "sun", locales.Brightness(), s.combinedBrightness()
+	if st.hasBrightness {
+		percent = combinedBrightnessFor(st)
+	} else {
+		percent = st.prefs.SoftBrightness
 	}
-	return "sun", locales.Brightness(), s.prefs.SoftBrightness
+	if s.displayCount() > 1 {
+		title = st.displayName() + " · " + title
+	}
+	return "sun", title, percent
 }
 
 // showHUD shows the level a key set under the menu bar icon (by the

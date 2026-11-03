@@ -84,9 +84,11 @@ func (a *app) ready(show bool) {
 	}()
 	mygo.App.OnWillQuit(func(*mygo.QuitEvent) {
 		a.s.save()
-		display.RestoreGamma()
-		if a.s.ddc != nil {
-			a.s.ddc.Close()
+		display.RestoreAllGamma()
+		for _, st := range a.s.stateList() {
+			if st.ddc != nil {
+				st.ddc.Close()
+			}
 		}
 		a.tray.Destroy()
 	})
@@ -103,7 +105,7 @@ func (a *app) ready(show bool) {
 				if a.s.syncMediaKeys(); denied != a.s.mediaKeysDenied {
 					a.s.redraw()
 				}
-				if a.s.prefs.FollowBuiltin && a.s.canFollow() {
+				if a.s.following() {
 					a.s.followTick(display.BuiltinBrightness)
 					a.s.redraw()
 				}

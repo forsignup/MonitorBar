@@ -14,7 +14,8 @@ import (
 // milder one was applied: Windows keeps gamma ramps near the identity.
 var ErrGammaLimited = errors.New("display: the system limited the dimming")
 
-// Monitor is the external display the app manages.
+// Monitor is an external display the app manages, or a MacBook's own
+// panel when no external one is on.
 type Monitor struct {
 	Name       string // e.g. "Mi Monitor"
 	Connection string // e.g. "HDMI", or "" when unknown
@@ -22,7 +23,45 @@ type Monitor struct {
 	// (Windows, from the EDID), zero otherwise.
 	NativeWidth, NativeHeight int
 	Builtin                   bool // a MacBook's own display, when no external one is on
-	handle                    handle
+	Primary                   bool // the system's main display, listed first
+
+	// Identity is the key of the monitor's settings: the panel's EDID, and
+	// the port's location only when two online panels share an EDID.
+	Identity string
+	Vendor   uint32
+	Model    uint32
+	Serial   uint32
+	Position string // the port's platform key, "" when the EDID is enough
+	x        int    // the display's left edge, for ordering
+	virtual  bool   // DisplayLink or a remote desktop, not a panel on a cable
+
+	handle handle
+}
+
+// edid is the monitor's identity fields, before they are matched to saved
+// settings.
+func (m Monitor) edid() Identity {
+	return Identity{Vendor: m.Vendor, Model: m.Model, Serial: m.Serial, Position: m.Position}
+}
+
+// displayKey names a display the system gave no identity.
+func displayKey(m Monitor) string { return fmt.Sprint(m.handle) }
+
+// BaseIdentity is the panel's EDID identity, without a port key: the key a
+// new monitor's settings start from.
+func (m Monitor) BaseIdentity() string { return m.edid().Base() }
+
+// Same tells whether two records name the same display handle, which changes
+// when a display is replugged.
+func (m Monitor) Same(other Monitor) bool { return m.handle == other.handle }
+
+// gammaKey is the display's key in the captured curves. The identity is
+// stable; the handle keeps displays the system didn't name apart.
+func (m Monitor) gammaKey() string {
+	if m.Identity != "" {
+		return m.Identity
+	}
+	return displayKey(m)
 }
 
 // NativeSize is the monitor's own resolution: what the system reports, or

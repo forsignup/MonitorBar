@@ -165,6 +165,16 @@ func (msgs Messages) CaptionExternal() string {
 	return Catalog.Format(msgs.locale, "captionExternal", nil)
 }
 
+// SwitchDisplay says "Switch display"
+// in the language the app shows.
+func SwitchDisplay() string { return In(i18n.Locale()).SwitchDisplay() }
+
+// SwitchDisplay says "Switch display"
+// in the language of msgs.
+func (msgs Messages) SwitchDisplay() string {
+	return Catalog.Format(msgs.locale, "switchDisplay", nil)
+}
+
 // AboutDetail says "Switch inputs, set the brightness and color temperature, the resolution, and see your screen time."
 // in the language the app shows.
 func AboutDetail() string { return In(i18n.Locale()).AboutDetail() }
@@ -295,6 +305,16 @@ func (msgs Messages) FooterDdc() string {
 	return Catalog.Format(msgs.locale, "footerDdc", nil)
 }
 
+// DetectingShort says "Detecting"
+// in the language the app shows.
+func DetectingShort() string { return In(i18n.Locale()).DetectingShort() }
+
+// DetectingShort says "Detecting"
+// in the language of msgs.
+func (msgs Messages) DetectingShort() string {
+	return Catalog.Format(msgs.locale, "detectingShort", nil)
+}
+
 // FooterDetecting says "Detecting the display…"
 // in the language the app shows.
 func FooterDetecting() string { return In(i18n.Locale()).FooterDetecting() }
@@ -303,6 +323,36 @@ func FooterDetecting() string { return In(i18n.Locale()).FooterDetecting() }
 // in the language of msgs.
 func (msgs Messages) FooterDetecting() string {
 	return Catalog.Format(msgs.locale, "footerDetecting", nil)
+}
+
+// FooterSoftware says "Software dimming only · no hardware control"
+// in the language the app shows.
+func FooterSoftware() string { return In(i18n.Locale()).FooterSoftware() }
+
+// FooterSoftware says "Software dimming only · no hardware control"
+// in the language of msgs.
+func (msgs Messages) FooterSoftware() string {
+	return Catalog.Format(msgs.locale, "footerSoftware", nil)
+}
+
+// Pairing says "Pair the LAN Remote"
+// in the language the app shows.
+func Pairing() string { return In(i18n.Locale()).Pairing() }
+
+// Pairing says "Pair the LAN Remote"
+// in the language of msgs.
+func (msgs Messages) Pairing() string {
+	return Catalog.Format(msgs.locale, "pairing", nil)
+}
+
+// PairingNote says "Choose this display's device on the network"
+// in the language the app shows.
+func PairingNote() string { return In(i18n.Locale()).PairingNote() }
+
+// PairingNote says "Choose this display's device on the network"
+// in the language of msgs.
+func (msgs Messages) PairingNote() string {
+	return Catalog.Format(msgs.locale, "pairingNote", nil)
 }
 
 // Inputs says "Input"

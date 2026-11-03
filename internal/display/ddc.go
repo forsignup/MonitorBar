@@ -1,11 +1,16 @@
 package display
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 	"sync"
 )
+
+// ErrNoHardwareControl means the monitor can't be reached over DDC/CI: it
+// doesn't answer, or the system can't tell its I2C bus from another one.
+var ErrNoHardwareControl = errors.New("display: no DDC/CI channel for this monitor")
 
 // MCCS VCP codes MonitorBar uses over DDC/CI.
 const (

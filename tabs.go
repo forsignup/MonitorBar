@@ -20,39 +20,41 @@ import (
 
 func (p *panel) overview(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	p.hero(c)
-	if sources := s.sources(); len(sources) > 0 {
+	if sources := sourcesFor(st); len(sources) > 0 {
 		card(c, func() {
-			cardTitle(c, locales.Inputs(), "plug", s.inputChannel())
+			cardTitle(c, locales.Inputs(), "plug", inputChannelFor(st))
 			ui.Grid(c).Columns(4).Gap(6).Children(func() {
 				for _, src := range sources {
-					if chipText(c.Key(src.ID), src.Name, s.input == src.ID) {
-						s.selectInput(src)
+					if chipText(c.Key(src.ID), src.Name, st.input == src.ID) {
+						s.selectInputFor(st, src)
 					}
 				}
 			})
 		})
 	}
-	if s.hasBrightness {
-		combined := s.combinedBrightness()
+	p.pairing(c)
+	if st.hasBrightness {
+		combined := combinedBrightnessFor(st)
 		caption := locales.BrightnessCombined()
 		switch {
 		case combined < switchover-0.5:
 			caption = locales.BrightnessMinimumSoftware()
 		case combined <= switchover+0.5:
 			caption = locales.BrightnessMinimum()
-		case s.prefs.FollowBuiltin && s.canFollow():
+		case st.prefs.FollowBuiltin && s.canFollowFor(st):
 			caption = locales.BrightnessFollowing()
 		}
 		if (sliderCard{key: "backlight", title: locales.Brightness(), caption: caption, icon: "sun",
 			value: &combined, lo: 0, hi: 100, step: 5}).show(c) {
-			s.setCombined(combined)
+			s.setCombinedFor(st, combined)
 		}
 	} else if (sliderCard{key: "brightness", title: locales.Brightness(), caption: locales.BrightnessSoftware(), icon: "sun",
-		value: &s.prefs.SoftBrightness, lo: 20, hi: 100, step: 5}).show(c) {
-		s.applyGamma()
+		value: &st.prefs.SoftBrightness, lo: 20, hi: 100, step: 5}).show(c) {
+		s.applyGammaFor(st)
 	}
-	if s.hasVolume {
+	if st.hasVolume {
 		p.volume(c)
 	}
 	p.scenes(c)
@@ -61,10 +63,11 @@ func (p *panel) overview(c *ui.Context) {
 // hero is a drawing of the monitor showing its current mode.
 func (p *panel) hero(c *ui.Context) {
 	s := p.s
-	glow := float32(s.effectiveBrightness() / 100)
+	st := s.targetState()
+	glow := float32(effectiveBrightness(st) / 100)
 	title, caption := "—", ""
-	if s.hasCurrent {
-		m := s.current
+	if st.hasCurrent {
+		m := st.current
 		title, caption = m.Title(), fmt.Sprintf("%d Hz", m.RefreshRate)
 		if m.HiDPI() {
 			caption = locales.ModeHiDPI(m.PixelWidth, m.PixelHeight, m.RefreshRate)
@@ -89,8 +92,8 @@ func (p *panel) hero(c *ui.Context) {
 		ui.Row(c).Gap(5).Padding(8, 6, 0, 6).Children(func() {
 			ui.Box(c).Size(4, 4).Radius(2).Background(accent)
 			ui.Text(c, locales.CurrentMode()).FontSize(9).Bold().LetterSpacing(1.1).TextColor(muted).Grow(1)
-			if s.monitor.Connection != "" {
-				ui.Text(c, s.monitor.Connection).FontSize(9).FontWeight(600).TextColor(accent)
+			if st.monitor.Connection != "" {
+				ui.Text(c, st.monitor.Connection).FontSize(9).FontWeight(600).TextColor(accent)
 			}
 		})
 	})
@@ -98,22 +101,23 @@ func (p *panel) hero(c *ui.Context) {
 
 func (p *panel) volume(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	card(c, func() {
 		ui.Row(c).Gap(8).Children(func() {
 			name, label := "volume", locales.Mute()
-			if s.volume == 0 {
+			if st.volume == 0 {
 				name, label = "volumeOff", locales.Unmute()
 			}
-			mute := chip(c.Key("mute"), s.volume == 0).Size(26, 22).Label(label)
+			mute := chip(c.Key("mute"), st.volume == 0).Size(26, 22).Label(label)
 			mute.Children(func() { icon(c, name).FontSize(12) })
 			if mute.Clicked() {
-				s.toggleMute()
+				s.toggleMuteFor(st)
 			}
 			ui.Text(c, locales.Volume()).FontSize(12).FontWeight(600).Grow(1)
-			ui.Text(c, fmt.Sprint(int(math.Round(s.volume)))).FontSize(20).FontWeight(600).FontFeatures("tnum")
+			ui.Text(c, fmt.Sprint(int(math.Round(st.volume)))).FontSize(20).FontWeight(600).FontFeatures("tnum")
 		})
-		if ui.Slider(c.Key("volume"), &s.volume, 0, 100).Label(locales.Volume()).Changed() {
-			s.setVolume(s.volume)
+		if ui.Slider(c.Key("volume"), &st.volume, 0, 100).Label(locales.Volume()).Changed() {
+			s.setVolumeFor(st, st.volume)
 		}
 	})
 }
@@ -137,29 +141,59 @@ func (p *panel) scenes(c *ui.Context) {
 	})
 }
 
+// pairing offers the LAN remotes no other display uses, when the target has
+// none: two HyperOS displays of the same name can't be told apart by their
+// names alone, so the user chooses.
+func (p *panel) pairing(c *ui.Context) {
+	s := p.s
+	if !s.unpaired() {
+		return
+	}
+	devices := s.freeDevices()
+	if len(devices) == 0 {
+		return
+	}
+	card(c, func() {
+		cardTitle(c, locales.Pairing(), "plug", "")
+		ui.Text(c, locales.PairingNote()).FontSize(10).TextColor(muted)
+		ui.Grid(c).Columns(2).Gap(6).Children(func() {
+			for _, d := range devices {
+				label := d.Host
+				if d.Name != "" {
+					label = d.Name + " · " + d.Host
+				}
+				if chipText(c.Key("pair-"+d.Host), label, false) {
+					s.pair(d.Host)
+				}
+			}
+		})
+	})
+}
+
 // MARK: 画面
 
 func (p *panel) picture(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	p.scenes(c)
-	if s.canFollow() {
+	if s.canFollowFor(st) {
 		p.followBuiltin(c)
 	}
 	p.autoSwitch(c)
 	if (sliderCard{key: "warmth", title: locales.Warmth(), caption: locales.WarmthNote(), icon: "thermometer",
-		value: &s.prefs.Warmth, lo: 0, hi: 100, step: 5, format: func(v float64) string {
+		value: &st.prefs.Warmth, lo: 0, hi: 100, step: 5, format: func(v float64) string {
 			if v < 1 {
 				return locales.WarmthNeutral()
 			}
 			return fmt.Sprint(int(math.Round(v)))
 		}}).show(c) {
-		s.applyGamma()
+		s.applyGammaFor(st)
 	}
-	for i := range s.controls { // only what the monitor answers over DDC/CI
-		ctl := &s.controls[i]
+	for i := range st.controls { // only what the monitor answers over DDC/CI
+		ctl := &st.controls[i]
 		if (sliderCard{key: fmt.Sprintf("ddc-%02x", ctl.code), title: ctl.label(), caption: locales.ControlNote(), icon: "sliders",
 			value: &ctl.value, lo: 0, hi: float64(ctl.max), step: 1}).show(c) {
-			s.setControl(i)
+			s.setControlFor(st, i)
 		}
 	}
 	reset := chip(c, false).Height(30)
@@ -269,28 +303,29 @@ func (p *panel) mediaKeys(c *ui.Context) {
 // display, whose brightness macOS sets by the ambient light.
 func (p *panel) followBuiltin(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	card(c, func() {
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			icon(c, "sun").FontSize(13)
 			ui.Text(c, locales.Follow()).FontSize(12).FontWeight(600).Grow(1)
-			if ui.Switch(c.Key("follow"), &s.prefs.FollowBuiltin).Label(locales.FollowSwitch()).Changed() {
+			if ui.Switch(c.Key("follow"), &st.prefs.FollowBuiltin).Label(locales.FollowSwitch()).Changed() {
 				s.followChanged()
 			}
 		})
-		if !s.prefs.FollowBuiltin {
+		if !st.prefs.FollowBuiltin {
 			ui.Text(c, locales.FollowNote()).FontSize(10).TextColor(muted)
 			return
 		}
 		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, locales.FollowRange()).FontSize(11)
 			ui.Spacer(c)
-			ui.Textf(c, "%d – %d", int(s.prefs.FollowMin), int(s.prefs.FollowMax)).FontSize(11).FontFeatures("tnum")
+			ui.Textf(c, "%d – %d", int(st.prefs.FollowMin), int(st.prefs.FollowMax)).FontSize(11).FontFeatures("tnum")
 		})
-		if ui.RangeSlider(c.Key("follow-range"), &s.prefs.FollowMin, &s.prefs.FollowMax, 0, 100, 1).Label(locales.FollowRange()).Changed() {
+		if ui.RangeSlider(c.Key("follow-range"), &st.prefs.FollowMin, &st.prefs.FollowMax, 0, 100, 1).Label(locales.FollowRange()).Changed() {
 			s.followChanged()
 		}
-		if s.lastBuiltin >= 0 {
-			ui.Text(c, locales.FollowStatus(int(math.Round(s.lastBuiltin*100)), int(math.Round(s.followTarget)))).
+		if st.lastBuiltin >= 0 {
+			ui.Text(c, locales.FollowStatus(int(math.Round(st.lastBuiltin*100)), int(math.Round(st.followTarget)))).
 				FontSize(10).TextColor(muted)
 		}
 	})
@@ -300,6 +335,7 @@ func (p *panel) followBuiltin(c *ui.Context) {
 // times.
 func (p *panel) autoSwitch(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	labels := make([]string, len(scenes))
 	for i, sc := range scenes {
 		labels[i] = sc.label()
@@ -308,11 +344,11 @@ func (p *panel) autoSwitch(c *ui.Context) {
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			icon(c, "clock").FontSize(13)
 			ui.Text(c, locales.Auto()).FontSize(12).FontWeight(600).Grow(1)
-			if ui.Switch(c.Key("auto"), &s.prefs.AutoSwitch).Label(locales.AutoSwitch()).Changed() {
+			if ui.Switch(c.Key("auto"), &st.prefs.AutoSwitch).Label(locales.AutoSwitch()).Changed() {
 				s.autoChanged()
 			}
 		})
-		if !s.prefs.AutoSwitch {
+		if !st.prefs.AutoSwitch {
 			ui.Text(c, locales.AutoNote()).FontSize(10).TextColor(muted)
 			return
 		}
@@ -331,8 +367,8 @@ func (p *panel) autoSwitch(c *ui.Context) {
 				}
 			})
 		}
-		row("day", locales.AutoDay(), &s.dayStart, &s.prefs.DayScene)
-		row("night", locales.AutoNight(), &s.nightStart, &s.prefs.NightScene)
+		row("day", locales.AutoDay(), &s.dayStart, &st.prefs.DayScene)
+		row("night", locales.AutoNight(), &s.nightStart, &st.prefs.NightScene)
 		ui.Text(c, s.autoStatus()).FontSize(10).TextColor(muted)
 	})
 }
@@ -341,14 +377,15 @@ func (p *panel) autoSwitch(c *ui.Context) {
 
 func (p *panel) modes(c *ui.Context) {
 	s := p.s
+	st := s.targetState()
 	rate := 60
-	if s.hasCurrent {
-		rate = s.current.RefreshRate
+	if st.hasCurrent {
+		rate = st.current.RefreshRate
 	}
-	if s.link != nil { // only the HyperOS remote can switch the monitor's own mode
+	if st.link != nil { // only the HyperOS remote can switch the monitor's own mode
 		card(c, func() {
 			trailing := ""
-			if s.switchingTo != "" {
+			if st.switchingTo != "" {
 				trailing = locales.CompetitiveSwitching()
 			}
 			cardTitle(c, locales.Competitive(), "sparkles", trailing)
@@ -363,9 +400,9 @@ func (p *panel) modes(c *ui.Context) {
 			})
 		})
 	}
-	if rates := display.RefreshRates(s.modes, s.current); len(rates) > 1 {
+	if rates := display.RefreshRates(st.modes, st.current); len(rates) > 1 {
 		card(c, func() {
-			cardTitle(c, locales.RefreshRate(), "gauge", s.current.Title())
+			cardTitle(c, locales.RefreshRate(), "gauge", st.current.Title())
 			ui.Grid(c).Columns(4).Gap(6).Children(func() {
 				for _, m := range rates {
 					if chipText(c.Key(m.ID()), fmt.Sprintf("%d Hz", m.RefreshRate), m.RefreshRate == rate) {
@@ -375,12 +412,13 @@ func (p *panel) modes(c *ui.Context) {
 			})
 		})
 	}
-	p.resolutions(c, locales.ModesHiDPI(), "zoom", display.Resolutions(s.modes, true, rate))
-	p.resolutions(c, locales.ModesStandard(), "layers", display.Resolutions(s.modes, false, rate))
+	p.resolutions(c, locales.ModesHiDPI(), "zoom", display.Resolutions(st.modes, true, rate))
+	p.resolutions(c, locales.ModesStandard(), "layers", display.Resolutions(st.modes, false, rate))
 }
 
 func (p *panel) resolutions(c *ui.Context, title, iconName string, modes []display.Mode) {
 	s := p.s
+	st := s.targetState()
 	if len(modes) == 0 {
 		return
 	}
@@ -388,7 +426,7 @@ func (p *panel) resolutions(c *ui.Context, title, iconName string, modes []displ
 		cardTitle(c, title, iconName, locales.ModesCount(len(modes)))
 		ui.Column(c).Gap(4).Children(func() {
 			for _, m := range modes {
-				selected := s.hasCurrent && m.SizeKey() == s.current.SizeKey()
+				selected := st.hasCurrent && m.SizeKey() == st.current.SizeKey()
 				row := ui.Row(c.Key(m.ID())).Height(28).PaddingX(9).Gap(8).Radius(8).Cursor(ui.CursorPointer)
 				if selected {
 					row.Background(accent.Alpha(0.14))

@@ -55,7 +55,8 @@ func inputShortcut(src mitv.Source) shortcut {
 
 const inputShortcutPrefix = "input-"
 
-// switchInput selects the input of id, when the display lists it.
+// switchInput selects the input of id, when the target lists it. An input
+// only another display has is not a reason to switch that one.
 func (s *store) switchInput(id int) {
 	for _, src := range s.sources() {
 		if src.ID == id {
@@ -66,7 +67,7 @@ func (s *store) switchInput(id int) {
 }
 
 // panelShortcuts are the shortcuts the panel lists: the fixed ones, and one
-// per input the display lists.
+// per input the target lists.
 func (s *store) panelShortcuts() []shortcut {
 	list := slices.Clone(shortcuts)
 	for _, src := range s.sources() {
